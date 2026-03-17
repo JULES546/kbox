@@ -1,0 +1,17 @@
+*.o
+/kbox
+tests/unit/test-runner
+rootfs.ext4
+alpine.ext4
+deps/
+lkl-x86_64/
+lkl-aarch64/
+target/
+tests/guest/*-test
+!tests/guest/*-test.c
+tests/stress/concurrent-io
+tests/stress/fd-exhaust
+tests/stress/long-running
+tests/stress/rapid-fork
+tests/stress/signal-race
+!tests/stress/*.c

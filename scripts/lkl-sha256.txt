@@ -1,0 +1,3 @@
+# SHA256 checksums for prebuilt LKL artifacts.
+# Update these after each LKL release build.
+# Format: <sha256>  <filename>
