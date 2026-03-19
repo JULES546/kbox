@@ -33,6 +33,11 @@ ifdef KBOX_HAS_SLIRP
   SLIRP_OBJS = $(SLIRP_SRCS:.c=.o)
 endif
 
+# Optional: Web observatory (set KBOX_HAS_WEB=1 to enable)
+ifdef KBOX_HAS_WEB
+  CFLAGS    += -DKBOX_HAS_WEB
+endif
+
 # Source files
 SRC_DIR  = src
 SRCS     = $(SRC_DIR)/main.c \
@@ -53,7 +58,10 @@ SRCS     = $(SRC_DIR)/main.c \
            $(SRC_DIR)/shadow-fd.c \
            $(SRC_DIR)/seccomp-dispatch.c \
            $(SRC_DIR)/seccomp-supervisor.c \
-           $(SRC_DIR)/net-slirp.c
+           $(SRC_DIR)/net-slirp.c \
+           $(SRC_DIR)/web-telemetry.c \
+           $(SRC_DIR)/web-events.c \
+           $(SRC_DIR)/web-server.c
 
 ifdef KBOX_HAS_SLIRP
   SRCS    += $(SLIRP_SRCS)
@@ -194,3 +202,6 @@ $(SRC_DIR)/seccomp-supervisor.o: include/kbox/seccomp.h include/kbox/seccomp-def
 $(SRC_DIR)/seccomp-bpf.o: include/kbox/seccomp.h include/kbox/seccomp-defs.h include/kbox/syscall-nr.h
 $(SRC_DIR)/seccomp-notify.o: include/kbox/seccomp.h include/kbox/seccomp-defs.h
 $(SRC_DIR)/net-slirp.o: include/kbox/net.h include/kbox/lkl-wrap.h include/kbox/syscall-nr.h
+$(SRC_DIR)/web-telemetry.o: include/kbox/web.h include/kbox/lkl-wrap.h include/kbox/syscall-nr.h
+$(SRC_DIR)/web-events.o: include/kbox/web.h
+$(SRC_DIR)/web-server.o: include/kbox/web.h include/kbox/fd-table.h include/kbox/lkl-wrap.h include/kbox/syscall-nr.h
