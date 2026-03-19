@@ -97,15 +97,22 @@ ROOTFS       = alpine.ext4
 
 # ---- Top-level targets ----
 
-.PHONY: all clean check check-unit check-integration check-stress guest-bins stress-bins rootfs fetch-lkl
+.PHONY: all clean check check-unit check-integration check-stress guest-bins stress-bins rootfs fetch-lkl install-hooks
 
 all: $(TARGET)
+ifneq ($(wildcard .git),)
+all: | .git/hooks/pre-commit
+endif
 
 $(TARGET): $(OBJS) | $(LKL_LIB)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Auto-install git hooks on first build (skipped in worktrees where .git is a file).
+.git/hooks/pre-commit: scripts/pre-commit.hook
+	@if [ -d .git/hooks ]; then $(MAKE) -s install-hooks; fi
 
 # Auto-fetch LKL if missing
 $(LKL_LIB):
@@ -154,8 +161,21 @@ $(ROOTFS): scripts/mkrootfs.sh scripts/alpine-sha256.txt $(GUEST_BINS) $(STRESS_
 
 # ---- Utilities ----
 
+# Fetch LKL from nightly release if not cached locally.
+# To force re-download: rm -rf lkl-x86_64 && make fetch-lkl
 fetch-lkl:
 	./scripts/fetch-lkl.sh
+
+# Install git hooks from scripts/*.hook into .git/hooks/.
+# Skips hooks that already exist (preserves user customizations).
+install-hooks:
+	@for hook in scripts/*.hook; do \
+	    name=$$(basename "$$hook" .hook); \
+	    if [ ! -e .git/hooks/"$$name" ] && [ ! -L .git/hooks/"$$name" ]; then \
+	        ln -s ../../"$$hook" .git/hooks/"$$name"; \
+	        echo "Installed $$name hook"; \
+	    fi; \
+	done
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) $(TEST_DIR)/*.o
