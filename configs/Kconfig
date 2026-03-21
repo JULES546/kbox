@@ -1,0 +1,65 @@
+# kbox Configuration
+
+mainmenu "kbox Configuration"
+
+# Feature Selection
+
+menu "Features"
+
+config HAS_SLIRP
+    bool "SLIRP networking (userspace TCP/IP)"
+    default y
+    help
+      Enable userspace networking via minislirp.
+      Provides TCP/IP connectivity for guest processes without
+      root privileges or TUN/TAP devices.
+      The minislirp library is fetched automatically if missing.
+
+config HAS_WEB
+    bool "Web observatory dashboard"
+    default y
+    help
+      Enable the built-in web telemetry server.
+      Provides a real-time dashboard for monitoring syscall
+      activity, FD table state, and performance counters.
+      Serves compiled-in HTML/CSS/JS assets on a local port.
+
+endmenu
+
+# Build Options
+
+menu "Build Options"
+
+choice
+    prompt "Build Mode"
+    default BUILD_DEBUG
+
+config BUILD_DEBUG
+    bool "Debug (ASAN/UBSAN, -O0 -g3)"
+    help
+      Development build with AddressSanitizer and
+      UndefinedBehaviorSanitizer enabled.
+      Slower execution but catches memory errors.
+
+config BUILD_RELEASE
+    bool "Release (-O2, no sanitizers)"
+    help
+      Optimized build for production use.
+      No sanitizers, no debug symbols.
+
+endchoice
+
+config LKL_DIR
+    string "LKL library directory"
+    default ""
+    help
+      Path to the LKL (Linux Kernel Library) directory.
+      Leave empty to use the default: lkl-$(ARCH).
+      The LKL library is fetched automatically if missing.
+
+endmenu
+
+# Marker for configured builds
+config CONFIGURED
+    bool
+    default y

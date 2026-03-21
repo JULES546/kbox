@@ -55,6 +55,9 @@ jobs:
             deps/
           key: rootfs-${{ hashFiles('scripts/alpine-sha256.txt', 'scripts/mkrootfs.sh', 'tests/guest/*.c', 'tests/stress/*.c', 'Makefile') }}
 
+      - name: Configure (defconfig)
+        run: make defconfig
+
       - name: Build kbox (debug + ASAN/UBSAN)
         run: make -j$(nproc)
 

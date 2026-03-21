@@ -1,0 +1,43 @@
+# External dependency fetching (LKL, minislirp)
+
+# Auto-fetch LKL if missing
+$(LKL_LIB):
+	@echo "  FETCH   lkl"
+	$(Q)./scripts/fetch-lkl.sh $(ARCH)
+
+.PHONY: fetch-lkl
+fetch-lkl:
+	@echo "  FETCH   lkl"
+	$(Q)./scripts/fetch-lkl.sh $(ARCH)
+
+# Auto-fetch minislirp if missing (shallow clone, no submodule).
+# $(wildcard) evaluates at parse time, so if minislirp has not been fetched yet
+# SLIRP_SRCS is empty. Guard: fetch and re-eval so the wildcard picks up
+# the newly-cloned sources.
+ifeq ($(CONFIG_HAS_SLIRP),y)
+ifneq ($(filter clean distclean config defconfig oldconfig savedefconfig indent,$(MAKECMDGOALS)),)
+else
+ifeq ($(wildcard $(SLIRP_HDR)),)
+$(shell ./scripts/fetch-minislirp.sh >&2)
+SLIRP_SRCS = $(shell ls $(SLIRP_DIR)/src/*.c 2>/dev/null)
+SLIRP_OBJS = $(SLIRP_SRCS:.c=.o)
+endif
+endif
+
+.PHONY: fetch-minislirp
+fetch-minislirp:
+	@echo "  FETCH   minislirp"
+	$(Q)scripts/fetch-minislirp.sh
+endif
+
+# Generate compiled-in web assets from web/ directory.
+# Re-run when any web/ file changes.
+ifeq ($(CONFIG_HAS_WEB),y)
+WEB_SRCS_ALL = $(wildcard web/*.html web/*.css web/*.js web/*.svg)
+$(WEB_ASSET_SRC): $(WEB_SRCS_ALL) scripts/gen-web-assets.sh
+	@echo "  GEN     $@"
+	$(Q)scripts/gen-web-assets.sh
+
+.PHONY: web-assets
+web-assets: $(WEB_ASSET_SRC)
+endif

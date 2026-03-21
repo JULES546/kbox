@@ -1,0 +1,48 @@
+# Feature-conditional source files and flags
+
+SRC_DIR  = src
+
+# Core sources (always built).
+# net-slirp.c, web-*.c have #ifdef guards and compile to empty TUs when their
+# feature is disabled -- no need to exclude them.
+SRCS     = $(SRC_DIR)/main.c \
+           $(SRC_DIR)/cli.c \
+           $(SRC_DIR)/syscall-nr.c \
+           $(SRC_DIR)/lkl-wrap.c \
+           $(SRC_DIR)/fd-table.c \
+           $(SRC_DIR)/procmem.c \
+           $(SRC_DIR)/path.c \
+           $(SRC_DIR)/identity.c \
+           $(SRC_DIR)/elf.c \
+           $(SRC_DIR)/mount.c \
+           $(SRC_DIR)/probe.c \
+           $(SRC_DIR)/image.c \
+           $(SRC_DIR)/seccomp-bpf.c \
+           $(SRC_DIR)/seccomp-notify.c \
+           $(SRC_DIR)/shadow-fd.c \
+           $(SRC_DIR)/seccomp-dispatch.c \
+           $(SRC_DIR)/seccomp-supervisor.c \
+           $(SRC_DIR)/net-slirp.c \
+           $(SRC_DIR)/web-telemetry.c \
+           $(SRC_DIR)/web-events.c \
+           $(SRC_DIR)/web-server.c
+
+# SLIRP networking
+ifeq ($(CONFIG_HAS_SLIRP),y)
+  SLIRP_DIR  = externals/minislirp
+  SLIRP_HDR  = $(SLIRP_DIR)/src/libslirp.h
+  CFLAGS    += -DKBOX_HAS_SLIRP -I$(SLIRP_DIR)/src
+  SLIRP_SRCS = $(wildcard $(SLIRP_DIR)/src/*.c)
+  SLIRP_OBJS = $(SLIRP_SRCS:.c=.o)
+  SRCS      += $(SLIRP_SRCS)
+endif
+
+# Web observatory
+ifeq ($(CONFIG_HAS_WEB),y)
+  CFLAGS       += -DKBOX_HAS_WEB
+  WEB_ASSET_SRC = $(SRC_DIR)/web-assets.c
+  SRCS         += $(WEB_ASSET_SRC)
+endif
+
+OBJS     = $(SRCS:.c=.o)
+TARGET   = kbox
