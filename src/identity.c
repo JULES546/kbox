@@ -272,6 +272,9 @@ int kbox_parse_change_id(const char *spec, uid_t *uid, gid_t *gid)
     if (*end != '\0' || errno != 0)
         return -1;
 
+    if ((unsigned long) (uid_t) u != u || (unsigned long) (gid_t) g != g)
+        return -1;
+
     *uid = (uid_t) u;
     *gid = (gid_t) g;
     return 0;

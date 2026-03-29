@@ -1,12 +1,15 @@
 # Build kbox and run full test suite.
 # Zero root required -- everything runs as an unprivileged user.
 #
-# Parallelism:
-#   unit-tests   -- no LKL, no rootfs, runs immediately
-#   build-kbox   -- fetches LKL, compiles kbox + guest/stress bins, builds rootfs
-#   integration  -- needs build-kbox artifacts, runs integration + stress tests
+# Parallelism (5 independent jobs, 1 sequential):
+#   coding-style     -- clang-format + newline checks (fast)
+#   static-analysis  -- security patterns + cppcheck
+#   unit-tests       -- no LKL dependency, ASAN/UBSAN
+#   build-kbox       -- fetches LKL, compiles kbox + guest/stress bins, builds rootfs
+#   integration      -- needs build-kbox artifacts, runs integration + stress tests
 #
-# unit-tests and build-kbox run in parallel. integration waits for build-kbox.
+# coding-style, static-analysis, unit-tests, and build-kbox run in parallel.
+# integration-tests waits for build-kbox only.
 name: Build and Test
 
 on:
@@ -16,6 +19,42 @@ on:
     branches: [main]
 
 jobs:
+  # ---- Coding style: formatting checks (fast, ~10s) ----
+  coding-style:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-20
+
+      - name: Check trailing newline
+        run: .ci/check-newline.sh
+
+      - name: Check clang-format
+        run: .ci/check-format.sh
+
+  # ---- Static analysis: security patterns + cppcheck ----
+  static-analysis:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Security checks
+        run: .ci/check-security.sh
+
+      - name: Static analysis (cppcheck)
+        run: .ci/check-cppcheck.sh
+
   # ---- Unit tests: no LKL dependency, fast ----
   unit-tests:
     runs-on: ubuntu-24.04

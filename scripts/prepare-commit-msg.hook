@@ -7,7 +7,7 @@ COMMIT_SOURCE="$2"
 
 # Only add guidance for new, interactive commits (no source = editor opened).
 case "$COMMIT_SOURCE" in
-    message | template | merge | squash | commit) exit 0 ;;
+message | template | merge | squash | commit) exit 0 ;;
 esac
 
 # If the message already has non-comment content (e.g. -m flag), skip.
@@ -21,7 +21,7 @@ CHANGED_FILES_COMMENTED=$(echo "$CHANGED_FILES" | sed 's/^/# - /')
 
 {
     echo
-    cat << 'EOF'
+    cat <<'EOF'
 #
 # Commit message rules (enforced by commit-msg hook):
 #  1. Separate subject from body with a blank line
@@ -41,4 +41,4 @@ EOF
     else
         echo "# (no staged files)"
     fi
-} > "$COMMIT_MSG_FILE"
+} >"$COMMIT_MSG_FILE"

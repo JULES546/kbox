@@ -12,7 +12,7 @@
 set -eu
 
 case "${1:-$(uname -m)}" in
-    x86_64 | amd64)  ARCH="x86_64"  ;;
+    x86_64 | amd64) ARCH="x86_64" ;;
     aarch64 | arm64) ARCH="aarch64" ;;
     *)
         echo "error: unsupported architecture: ${1:-$(uname -m)}" >&2
@@ -24,7 +24,11 @@ LKL_DIR="${LKL_DIR:-lkl-${ARCH}}"
 LKL_SRC="${LKL_SRC:-build/lkl-src}"
 LKL_UPSTREAM="https://github.com/lkl/linux"
 
-die() { echo "error: $*" >&2; exit 1; }
+die()
+{
+    echo "error: $*" >&2
+    exit 1
+}
 
 # ---- Clone or update source tree ----------------------------------------
 
@@ -66,8 +70,7 @@ for opt in \
     CONFIG_PRINTK \
     CONFIG_TRACEPOINTS \
     CONFIG_FTRACE \
-    CONFIG_DEBUG_FS \
-; do
+    CONFIG_DEBUG_FS; do
     "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --enable "${opt}"
 done
 
@@ -80,8 +83,7 @@ for opt in \
     CONFIG_USB_SUPPORT \
     CONFIG_INPUT \
     CONFIG_NFS_FS \
-    CONFIG_CIFS \
-; do
+    CONFIG_CIFS; do
     "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --disable "${opt}"
 done
 
@@ -89,7 +91,7 @@ make -C "${LKL_SRC}" ARCH=lkl olddefconfig
 
 # ---- Build ---------------------------------------------------------------
 
-NPROC=$(nproc 2>/dev/null || echo 1)
+NPROC=$(nproc 2> /dev/null || echo 1)
 
 echo "  BUILD   ARCH=lkl kernel (-j${NPROC})"
 make -C "${LKL_SRC}" ARCH=lkl -j"${NPROC}"
@@ -104,10 +106,10 @@ test -f "${LKL_SRC}/tools/lkl/liblkl.a" \
 
 echo "  VERIFY  symbols"
 for sym in lkl_init lkl_start_kernel lkl_cleanup lkl_syscall \
-           lkl_strerror lkl_disk_add lkl_mount_dev \
-           lkl_host_ops lkl_dev_blk_ops; do
-    if ! nm "${LKL_SRC}/tools/lkl/liblkl.a" 2>/dev/null \
-         | awk -v s="$sym" '$3==s && $2~/^[TtDdBbRr]$/{found=1} END{exit !found}'; then
+    lkl_strerror lkl_disk_add lkl_mount_dev \
+    lkl_host_ops lkl_dev_blk_ops; do
+    if ! nm "${LKL_SRC}/tools/lkl/liblkl.a" 2> /dev/null \
+        | awk -v s="$sym" '$3==s && $2~/^[TtDdBbRr]$/{found=1} END{exit !found}'; then
         die "MISSING symbol: ${sym}"
     fi
 done
@@ -117,10 +119,10 @@ done
 echo "  INSTALL ${LKL_DIR}/"
 mkdir -p "${LKL_DIR}"
 
-cp "${LKL_SRC}/tools/lkl/liblkl.a"               "${LKL_DIR}/"
-cp "${LKL_SRC}/tools/lkl/include/lkl.h"          "${LKL_DIR}/" 2>/dev/null || true
-cp "${LKL_SRC}/tools/lkl/include/lkl/autoconf.h" "${LKL_DIR}/" 2>/dev/null || true
-cp "${LKL_SRC}/scripts/gdb/vmlinux-gdb.py"        "${LKL_DIR}/" 2>/dev/null || true
+cp "${LKL_SRC}/tools/lkl/liblkl.a" "${LKL_DIR}/"
+cp "${LKL_SRC}/tools/lkl/include/lkl.h" "${LKL_DIR}/" 2> /dev/null || true
+cp "${LKL_SRC}/tools/lkl/include/lkl/autoconf.h" "${LKL_DIR}/" 2> /dev/null || true
+cp "${LKL_SRC}/scripts/gdb/vmlinux-gdb.py" "${LKL_DIR}/" 2> /dev/null || true
 
 printf 'commit=%s\ndate=%s\narch=%s\n' \
     "$(git -C "${LKL_SRC}" rev-parse HEAD)" \
@@ -128,6 +130,6 @@ printf 'commit=%s\ndate=%s\narch=%s\n' \
     "${ARCH}" \
     > "${LKL_DIR}/BUILD_INFO"
 
-( cd "${LKL_DIR}" && sha256sum ./* > sha256sums.txt )
+(cd "${LKL_DIR}" && sha256sum ./* > sha256sums.txt)
 
 echo "OK: ${LKL_DIR}/liblkl.a"

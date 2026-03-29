@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,8 +134,9 @@ static int parse_image_args(int argc,
             break;
         case 'p': {
             char *end;
+            errno = 0;
             unsigned long v = strtoul(optarg, &end, 10);
-            if (*end != '\0') {
+            if (*end != '\0' || errno != 0 || v > UINT_MAX) {
                 fprintf(stderr, "invalid partition: %s\n", optarg);
                 return -1;
             }

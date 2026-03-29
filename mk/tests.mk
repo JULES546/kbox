@@ -6,6 +6,7 @@ TEST_DIR   = tests/unit
 TEST_SRCS  = $(TEST_DIR)/test-runner.c \
              $(TEST_DIR)/test-fd-table.c \
              $(TEST_DIR)/test-path.c \
+             $(TEST_DIR)/test-cli.c \
              $(TEST_DIR)/test-identity.c \
              $(TEST_DIR)/test-syscall-nr.c \
              $(TEST_DIR)/test-elf.c \
@@ -29,6 +30,7 @@ endif
 # Unit tests link only the pure-computation sources (no LKL)
 TEST_SUPPORT_SRCS = $(SRC_DIR)/fd-table.c \
                     $(SRC_DIR)/path.c \
+                    $(SRC_DIR)/cli.c \
                     $(SRC_DIR)/identity.c \
                     $(SRC_DIR)/syscall-nr.c \
                     $(SRC_DIR)/elf.c \
@@ -111,4 +113,45 @@ $(ROOTFS): scripts/mkrootfs.sh scripts/alpine-sha256.txt $(GUEST_BINS) $(STRESS_
 	@echo "  GEN     $@"
 	$(Q)ALPINE_ARCH=$(ARCH) ./scripts/mkrootfs.sh
 
-.PHONY: check check-unit check-integration check-stress guest-bins stress-bins rootfs
+# ---- Syntax-only compilation check (used by pre-commit hook) ----
+# Usage: make check-syntax CHK_SOURCES="src/foo.c src/bar.c"
+# Uses the project's real CFLAGS with -fsyntax-only (no linking, no .o output).
+# Skips gracefully on non-Linux compilers.
+
+CHK_CC_TARGET := $(shell $(CC) -dumpmachine 2>/dev/null)
+check-syntax:
+ifeq ($(findstring linux,$(CHK_CC_TARGET)),)
+	@echo "  SKIP    check-syntax (non-Linux compiler: $(CHK_CC_TARGET))"
+else
+ifdef CHK_SOURCES
+	@echo "  SYNTAX  $(words $(CHK_SOURCES)) file(s)"
+	$(Q)$(CC) $(CFLAGS) -DKBOX_UNIT_TEST -fsyntax-only \
+	    -Werror=implicit-function-declaration \
+	    -Werror=incompatible-pointer-types \
+	    -Werror=int-conversion \
+	    -Werror=return-type \
+	    -Werror=format=2 \
+	    -Werror=format-security \
+	    -Werror=strict-prototypes \
+	    -Werror=old-style-definition \
+	    -Werror=sizeof-pointer-memaccess \
+	    -Werror=vla \
+	    $(CHK_SOURCES)
+else
+	@echo "  SYNTAX  all source files"
+	$(Q)$(CC) $(CFLAGS) -DKBOX_UNIT_TEST -fsyntax-only \
+	    -Werror=implicit-function-declaration \
+	    -Werror=incompatible-pointer-types \
+	    -Werror=int-conversion \
+	    -Werror=return-type \
+	    -Werror=format=2 \
+	    -Werror=format-security \
+	    -Werror=strict-prototypes \
+	    -Werror=old-style-definition \
+	    -Werror=sizeof-pointer-memaccess \
+	    -Werror=vla \
+	    $(SRCS)
+endif
+endif
+
+.PHONY: check check-unit check-integration check-stress guest-bins stress-bins rootfs check-syntax

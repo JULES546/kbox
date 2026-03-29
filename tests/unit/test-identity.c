@@ -128,6 +128,26 @@ static void test_parse_change_id_zero(void)
     ASSERT_EQ(gid, 0);
 }
 
+static void test_parse_change_id_rejects_uid_overflow(void)
+{
+    uid_t uid = 1;
+    gid_t gid = 2;
+
+    ASSERT_EQ(kbox_parse_change_id("4294967296:0", &uid, &gid), -1);
+    ASSERT_EQ(uid, 1);
+    ASSERT_EQ(gid, 2);
+}
+
+static void test_parse_change_id_rejects_gid_overflow(void)
+{
+    uid_t uid = 3;
+    gid_t gid = 4;
+
+    ASSERT_EQ(kbox_parse_change_id("0:4294967296", &uid, &gid), -1);
+    ASSERT_EQ(uid, 3);
+    ASSERT_EQ(gid, 4);
+}
+
 void test_identity_init(void)
 {
     TEST_REGISTER(test_hash_username_deterministic);
@@ -146,4 +166,6 @@ void test_identity_init(void)
     TEST_REGISTER(test_normalized_unknown_path);
     TEST_REGISTER(test_parse_change_id_valid);
     TEST_REGISTER(test_parse_change_id_zero);
+    TEST_REGISTER(test_parse_change_id_rejects_uid_overflow);
+    TEST_REGISTER(test_parse_change_id_rejects_gid_overflow);
 }

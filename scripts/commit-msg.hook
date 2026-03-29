@@ -3,11 +3,23 @@
 # commit-msg hook for kbox: validate message format and append Change-Id.
 # Adapted from git-good-commit (MIT License) via lab0-c.
 
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [ -L "$source" ]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd) || return 1
+        source=$(readlink "$source") || return 1
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
 COMMIT_MSG_FILE="$1"
 
 # Source common.sh for color support (optional -- degrades gracefully).
-common_script="$(dirname "$0")/../../scripts/common.sh"
-[ -r "$common_script" ] && source "$common_script" && set_colors 2> /dev/null
+script_dir=$(resolve_script_dir) || script_dir=""
+common_script="$script_dir/common.sh"
+[ -r "$common_script" ] && source "$common_script" && set_colors 2>/dev/null
 RED="${RED:-}" GREEN="${GREEN:-}" YELLOW="${YELLOW:-}" CYAN="${CYAN:-}" NC="${NC:-}"
 
 WARNINGS=()
@@ -29,7 +41,7 @@ while IFS= read -r line; do
     # Skip comment lines.
     [[ $line =~ ^# ]] && continue
     COMMIT_MSG_LINES+=("$line")
-done < "$COMMIT_MSG_FILE"
+done <"$COMMIT_MSG_FILE"
 
 # Strip trailing blank lines.
 while [ ${#COMMIT_MSG_LINES[@]} -gt 0 ] && [ -z "${COMMIT_MSG_LINES[-1]}" ]; do
@@ -166,12 +178,12 @@ else
 
     # 11. Reject placeholder/padding text (runs of 4+ identical alphabetic characters).
     padding_char=$(printf '%s' "$SUBJECT" | awk '{
-	prev = ""; run = 0
-	for (i = 1; i <= length($0); i++) {
-		c = substr($0, i, 1)
-		if (c == prev) { run++ } else { run = 1; prev = c }
-		if (run >= 4 && c ~ /[A-Za-z]/) { printf "%s", c; exit }
-	}
+    prev = ""; run = 0
+    for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (c == prev) { run++ } else { run = 1; prev = c }
+        if (run >= 4 && c ~ /[A-Za-z]/) { printf "%s", c; exit }
+    }
 }')
     if [ -n "$padding_char" ]; then
         add_error "Subject contains repeated padding '${padding_char}${padding_char}${padding_char}${padding_char}...' (placeholder text?)"
@@ -216,7 +228,7 @@ clean_message=$(sed -e '/^#/d' -e '/^diff --git /{ s///; q; }' \
 _gen_changeid_input() {
     echo "tree $(git write-tree)"
     local parent
-    if parent=$(git rev-parse "HEAD^0" 2> /dev/null); then
+    if parent=$(git rev-parse "HEAD^0" 2>/dev/null); then
         echo "parent $parent"
     fi
     echo "author $(git var GIT_AUTHOR_IDENT)"
@@ -232,7 +244,7 @@ commentChar=$(git config --get core.commentChar || echo '#')
 
 awk -v id="$change_id" -v cc="$commentChar" '
 BEGIN {
-	isFooter = 0; footerComment = 0; blankLines = 0
+    isFooter = 0; footerComment = 0; blankLines = 0
 }
 index($0, cc) == 1 { next }
 /^diff --git / { blankLines = 0; while (getline) {}; next }
@@ -240,35 +252,35 @@ index($0, cc) == 1 { next }
 /^\[[a-zA-Z0-9-]+:/ && (isFooter == 1) { footerComment = 1 }
 /]$/ && (footerComment == 1) { footerComment = 2 }
 (blankLines > 0) {
-	print lines
-	for (i = 0; i < blankLines; i++) print ""
-	lines = ""; blankLines = 0; isFooter = 1; footerComment = 0
+    print lines
+    for (i = 0; i < blankLines; i++) print ""
+    lines = ""; blankLines = 0; isFooter = 1; footerComment = 0
 }
 (footerComment == 0) && (!/^\[?[a-zA-Z0-9-]+:/ || /^[a-zA-Z0-9-]+:\/\//) {
-	isFooter = 0
+    isFooter = 0
 }
 {
-	if (footerComment == 2) footerComment = 0
-	if (lines != "") lines = lines "\n"
-	lines = lines $0
+    if (footerComment == 2) footerComment = 0
+    if (lines != "") lines = lines "\n"
+    lines = lines $0
 }
 END {
-	unprinted = 1
-	if (isFooter == 0) { print lines "\n"; lines = "" }
-	# Split footer, place Change-Id after other trailers but before *-by lines.
-	numlines = split(lines, footer, "\n")
-	trailers = ""; other = ""
-	for (i = 1; i <= numlines; i++) {
-		low = tolower(footer[i])
-		if (low ~ /^(signed-off|reviewed|co-authored|acked|suggested|tested|reported)-by:/) {
-			trailers = trailers footer[i] "\n"
-		} else {
-			other = other footer[i] "\n"
-		}
-	}
-	if (other != "") printf "%s", other
-	if (trailers != "") printf "%s", trailers
-	printf "Change-Id: I%s\n", id
-}' "$COMMIT_MSG_FILE" > "${COMMIT_MSG_FILE}.tmp" \
-    && mv "${COMMIT_MSG_FILE}.tmp" "$COMMIT_MSG_FILE" \
-    || rm -f "${COMMIT_MSG_FILE}.tmp"
+    unprinted = 1
+    if (isFooter == 0) { print lines "\n"; lines = "" }
+    # Split footer, place Change-Id after other trailers but before *-by lines.
+    numlines = split(lines, footer, "\n")
+    trailers = ""; other = ""
+    for (i = 1; i <= numlines; i++) {
+        low = tolower(footer[i])
+        if (low ~ /^(signed-off|reviewed|co-authored|acked|suggested|tested|reported)-by:/) {
+            trailers = trailers footer[i] "\n"
+        } else {
+            other = other footer[i] "\n"
+        }
+    }
+    if (other != "") printf "%s", other
+    if (trailers != "") printf "%s", trailers
+    printf "Change-Id: I%s\n", id
+}' "$COMMIT_MSG_FILE" >"${COMMIT_MSG_FILE}.tmp" &&
+    mv "${COMMIT_MSG_FILE}.tmp" "$COMMIT_MSG_FILE" ||
+    rm -f "${COMMIT_MSG_FILE}.tmp"

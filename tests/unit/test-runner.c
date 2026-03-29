@@ -91,6 +91,7 @@ void test_pass(void)
 /* Portable test suites (all hosts) */
 extern void test_fd_table_init(void);
 extern void test_path_init(void);
+extern void test_cli_init(void);
 extern void test_identity_init(void);
 extern void test_syscall_nr_init(void);
 extern void test_elf_init(void);
@@ -119,6 +120,7 @@ int main(int argc, char *argv[])
     /* Portable suites */
     test_fd_table_init();
     test_path_init();
+    test_cli_init();
     test_identity_init();
     test_syscall_nr_init();
     test_elf_init();

@@ -3,17 +3,40 @@
 
 set_colors()
 {
-    if [ -t 1 ] && command -v tput > /dev/null 2>&1 && [ "$(tput colors 2> /dev/null)" -ge 8 ] 2> /dev/null; then
-        RED='\033[0;31m'
-        GREEN='\033[0;32m'
-        YELLOW='\033[0;33m'
-        CYAN='\033[0;36m'
+    local default_color
+    default_color=$(git config --get color.ui 2> /dev/null || echo 'auto')
+    if [[ "$default_color" == "always" ]] || [[ "$default_color" == "auto" && -t 1 ]]; then
+        RED='\033[1;31m'
+        GREEN='\033[1;32m'
+        YELLOW='\033[1;33m'
+        BLUE='\033[1;34m'
+        WHITE='\033[1;37m'
+        CYAN='\033[1;36m'
         NC='\033[0m'
     else
         RED=''
         GREEN=''
         YELLOW=''
+        BLUE=''
+        WHITE=''
         CYAN=''
         NC=''
+    fi
+}
+
+# Print a fatal error message and exit.
+throw()
+{
+    local fmt="$1"
+    shift
+    printf "\n${RED}[!] $fmt${NC}\n" "$@" >&2
+    exit 1
+}
+
+# Skip hooks entirely when running in CI (GitHub Actions, etc.).
+check_ci()
+{
+    if [ -n "${CI:-}" ] || [ -d "/home/runner/work" ]; then
+        exit 0
     fi
 }

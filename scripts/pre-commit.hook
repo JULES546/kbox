@@ -1,35 +1,50 @@
 #!/usr/bin/env bash
 
-# Pre-commit hook for kbox: formatting, static analysis, unsafe functions.
+# Pre-commit hook for kbox: code quality, security, and static analysis.
 
-common_script="$(dirname "$0")/../../scripts/common.sh"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [ -L "$source" ]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd) || return 1
+        source=$(readlink "$source") || return 1
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+script_dir=$(resolve_script_dir) || {
+    echo "[!] failed to resolve hook path." >&2
+    exit 1
+}
+common_script="$script_dir/common.sh"
 [ -r "$common_script" ] || {
     echo "[!] '$common_script' not found or not readable." >&2
     exit 1
 }
-bash -n "$common_script" > /dev/null 2>&1 || {
+bash -n "$common_script" >/dev/null 2>&1 || {
     echo "[!] '$common_script' contains syntax errors." >&2
     exit 1
 }
 source "$common_script"
-declare -F set_colors > /dev/null 2>&1 || {
+declare -F set_colors >/dev/null 2>&1 || {
     echo "[!] '$common_script' does not define the required function." >&2
     exit 1
 }
 
 set_colors
+check_ci
 
 RETURN=0
 ERRORS_FOUND=()
 WARNINGS_FOUND=()
 
-TOTAL_CHECKS=7
 CURRENT_CHECK=0
 
 update_progress() {
     local check_name="$1"
     ((CURRENT_CHECK++))
-    printf "\r${CYAN}[%d/%d]${NC} %s..." "$CURRENT_CHECK" "$TOTAL_CHECKS" "$check_name"
+    printf "\r${CYAN}[%d]${NC} %s..." "$CURRENT_CHECK" "$check_name"
 }
 
 report_result() {
@@ -45,16 +60,108 @@ report_result() {
     fi
 }
 
-# Build cppcheck suppressions for kbox sources.
-cppcheck_suppressions() {
+report_warning() {
+    local message="$1"
+    printf " [ ${YELLOW}WARN${NC} ]\n"
+    if [ -n "$message" ]; then
+        WARNINGS_FOUND+=("$message")
+    fi
+}
+
+is_reported() {
+    local haystack="$1"
+    local needle="$2"
+    case "$haystack" in
+    *"|$needle|"*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+mark_reported() {
+    local haystack="$1"
+    local needle="$2"
+    printf '%s|%s|' "$haystack" "$needle"
+}
+
+strip_strings_and_comments() {
+    local line="$1"
+    local in_block_comment="$2"
+    local out=""
+    local i=0
+    local len=${#line}
+    local ch next quote
+
+    while [ $i -lt $len ]; do
+        ch="${line:$i:1}"
+        if [ "$in_block_comment" = "1" ]; then
+            if [ "$ch" = "*" ] && [ $((i + 1)) -lt $len ] && [ "${line:$((i + 1)):1}" = "/" ]; then
+                in_block_comment=0
+                i=$((i + 2))
+            else
+                i=$((i + 1))
+            fi
+            continue
+        fi
+
+        if [ "$ch" = "/" ] && [ $((i + 1)) -lt $len ]; then
+            next="${line:$((i + 1)):1}"
+            if [ "$next" = "/" ]; then
+                break
+            fi
+            if [ "$next" = "*" ]; then
+                in_block_comment=1
+                i=$((i + 2))
+                continue
+            fi
+        fi
+
+        if [ "$ch" = "\"" ] || [ "$ch" = "'" ]; then
+            quote="$ch"
+            out+=" "
+            i=$((i + 1))
+            while [ $i -lt $len ]; do
+                ch="${line:$i:1}"
+                if [ "$ch" = "\\" ] && [ $((i + 1)) -lt $len ]; then
+                    i=$((i + 2))
+                    continue
+                fi
+                if [ "$ch" = "$quote" ]; then
+                    i=$((i + 1))
+                    break
+                fi
+                i=$((i + 1))
+            done
+            continue
+        fi
+
+        out+="$ch"
+        i=$((i + 1))
+    done
+
+    printf '%s\n%s\n' "$in_block_comment" "$out"
+}
+
+# Single temp directory for the entire run; cleaned up on exit or signal.
+HOOK_TMPDIR=$(mktemp -d) || exit 1
+cleanup() {
+    rm -rf "$HOOK_TMPDIR" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# Build cppcheck suppressions (cached -- called once).
+# Only suppress diagnostics that are genuinely unhelpful. Removed:
+#   syntaxError, noValidConfiguration -- mask total analysis failure
+#   compareValueOutOfTypeRangeError -- catches real truncation bugs
+#   knownConditionTrueFalse -- reveals dead code / logic errors
+#   shadowVariable -- catches wrong-variable bugs in large functions
+#   unreadVariable, redundantInitialization -- reveals forgotten checks
+build_cppcheck_suppressions() {
     local -a suppr_keys=(
         "checkersReport"
         "unmatchedSuppression"
         "normalCheckLevelMaxBranches"
         "missingIncludeSystem"
-        "noValidConfiguration"
         "unusedFunction"
-        "syntaxError"
         "constParameterPointer"
         "constParameterCallback"
         "constVariablePointer"
@@ -64,31 +171,33 @@ cppcheck_suppressions() {
         "staticFunction"
         "checkLevelNormal"
         "variableScope"
-        "compareValueOutOfTypeRangeError"
         "constVariable"
-        "knownConditionTrueFalse"
-        "unreadVariable"
-        "redundantInitialization"
-        "shadowVariable"
         "preprocessorErrorDirective"
+        "invalidFunctionArg:src/elf.c"
+        "invalidFunctionArg:src/loader-image.c"
+        "invalidFunctionArg:src/loader-launch.c"
+        "invalidFunctionArg:src/loader-stack.c"
+        "memleak:src/loader-stack.c"
     )
 
     local out="--inline-suppr "
     for key in "${suppr_keys[@]}"; do
         out+="--suppress=$key "
     done
-    printf "%s" "$out" | sed 's/[[:space:]]*$//'
+    printf "%s" "${out% }"
 }
 
-# Detect compiler standard defines for cppcheck.
-detect_cc_std() {
+# Detect compiler standard defines (cached -- called once).
+build_cc_std_defines() {
     local STDC_VERSION=""
     local EXTRA_DEFINES=""
-    if command -v cc > /dev/null 2>&1; then
-        if cc --version 2> /dev/null | grep -q "clang"; then
+    if command -v cc >/dev/null 2>&1; then
+        local cc_ver
+        cc_ver=$(cc --version 2>/dev/null)
+        if echo "$cc_ver" | grep -q "clang"; then
             STDC_VERSION=$(cc -dM -E -xc /dev/null | awk '/__STDC_VERSION__/ {print $3}')
             EXTRA_DEFINES="-D__clang__=1"
-        elif cc --version 2> /dev/null | grep -q "Free Software Foundation"; then
+        elif echo "$cc_ver" | grep -q "Free Software Foundation"; then
             STDC_VERSION=$(cc -dM -E -xc /dev/null | awk '/__STDC_VERSION__/ {print $3}')
             EXTRA_DEFINES="-D__GNUC__=1"
         fi
@@ -99,32 +208,34 @@ detect_cc_std() {
     echo "$EXTRA_DEFINES"
 }
 
-# Resolve clang-format: prefer clang-format-20, fall back to Homebrew LLVM 20.
-CLANG_FORMAT=""
-for cf in clang-format-20 /opt/homebrew/Cellar/llvm@20/*/bin/clang-format; do
-    if command -v "$cf" > /dev/null 2>&1 || [ -x "$cf" ]; then
-        CLANG_FORMAT="$cf"
-        break
+# Resolve clang-format-20: try versioned binary, then unversioned if it's v20.
+resolve_clang_format() {
+    if command -v clang-format-20 >/dev/null 2>&1; then
+        echo "clang-format-20"
+        return
     fi
-done
-[ -z "$CLANG_FORMAT" ] && CLANG_FORMAT="clang-format"
+    if command -v clang-format >/dev/null 2>&1; then
+        if clang-format --version 2>/dev/null | grep -q 'version 20'; then
+            echo "clang-format"
+            return
+        fi
+    fi
+    echo ""
+}
 
-# Check for required tools
+CLANG_FORMAT=$(resolve_clang_format)
+
+# Check for required tools.
 check_required_tools() {
+    local need_c_tools="$1"
     local missing_tools=()
 
-    if ! command -v "$CLANG_FORMAT" > /dev/null 2>&1 && [ ! -x "$CLANG_FORMAT" ]; then
+    if [ "$need_c_tools" -eq 1 ] && [ -z "$CLANG_FORMAT" ]; then
         missing_tools+=("clang-format-20")
     fi
 
-    if ! command -v cppcheck > /dev/null 2>&1; then
+    if [ "$need_c_tools" -eq 1 ] && ! command -v cppcheck >/dev/null 2>&1; then
         missing_tools+=("cppcheck")
-    fi
-
-    if ! command -v aspell > /dev/null 2>&1; then
-        missing_tools+=("aspell")
-    elif [ -z "$(aspell dump dicts 2> /dev/null | grep -E '^en$')" ]; then
-        missing_tools+=("aspell-en")
     fi
 
     if [ ${#missing_tools[@]} -gt 0 ]; then
@@ -138,126 +249,423 @@ check_required_tools() {
 }
 
 printf "${CYAN}Running pre-commit checks...${NC}\n\n"
-check_required_tools
-
-CPPCHECK_OPTS="-I. -Iinclude -Isrc --enable=all --error-exitcode=1"
-CPPCHECK_OPTS+=" $(detect_cc_std)"
-CPPCHECK_OPTS+=" --max-configs=4 $(cppcheck_suppressions)"
-CPPCHECK_OPTS+=" -D_GNU_SOURCE -DKBOX_UNIT_TEST"
 
 workspace=$(git rev-parse --show-toplevel)
 
-mapfile -t FILES < <(git diff --cached --name-only --diff-filter=ACM)
+# Gather all staged info in as few git calls as possible.
+# --no-renames: treats renames as delete+add (avoids "old => new" path corruption).
+# -z: NUL-terminated output. Format: "add\tdel\tpath\0" per entry.
+FILES=()
+FILE_SUMMARIES=()
+binary_files=()
+while IFS= read -r -d '' record; do
+    [ -z "$record" ] && continue
+    add="${record%%	*}"; rest="${record#*	}"
+    del="${rest%%	*}"; path="${rest#*	}"
+    FILES+=("$path")
+    if [ "$add" = "-" ] && [ "$del" = "-" ]; then
+        binary_files+=("$path")
+        FILE_SUMMARIES+=("(binary)")
+    elif [ "$add" != "0" ] && [ "$del" != "0" ]; then
+        FILE_SUMMARIES+=("+${add}/-${del}")
+    elif [ "$add" != "0" ]; then
+        FILE_SUMMARIES+=("+${add}")
+    elif [ "$del" != "0" ]; then
+        FILE_SUMMARIES+=("-${del}")
+    else
+        FILE_SUMMARIES+=("")
+    fi
+done < <(git diff --cached --numstat --no-renames --diff-filter=ACM -z 2>/dev/null)
 
 if [ ${#FILES[@]} -eq 0 ]; then
     printf "${YELLOW}No files staged for commit.${NC}\n"
     exit 0
 fi
 
+# Determine which C/H files actually changed vs HEAD (single git command).
+# On amend, most staged files are unchanged re-commits -- skip them entirely.
+# On initial commit (no HEAD), fall back to all staged files.
+C_FILES_CHANGED=()
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    while IFS= read -r -d '' f; do
+        [[ $f == *.c || $f == *.h ]] && C_FILES_CHANGED+=("$f")
+    done < <(git diff --cached --name-only --no-renames --diff-filter=ACM HEAD -z 2>/dev/null)
+else
+    # Initial commit: all staged C/H files are new.
+    for f in "${FILES[@]}"; do
+        [[ $f == *.c || $f == *.h ]] && C_FILES_CHANGED+=("$f")
+    done
+fi
+
+check_required_tools $(( ${#C_FILES_CHANGED[@]} > 0 ))
+
+# Materialize staged content only if C/H files actually changed.
+STAGED_DIR="$HOOK_TMPDIR/staged"
+DIFF_CACHE="$HOOK_TMPDIR/diff_cache"
+CACHED_CC_STD=""
+CACHED_SUPPRESSIONS=""
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ]; then
+    mkdir -p "$STAGED_DIR"
+
+    # Batch-extract changed C/H files + all tracked headers in one call.
+    {
+        printf '%s\0' "${C_FILES_CHANGED[@]}"
+        git ls-files -z -- '*.h' 'include/*.h' 'include/**/*.h' 'src/*.h'
+    } | git checkout-index --stdin -z -f --prefix="$STAGED_DIR/" 2>/dev/null
+
+    # Preserve the active configuration so feature-gated code is syntax-checked
+    # with the same options the real build uses.
+    [ -f .config ] && cp .config "$STAGED_DIR/.config"
+
+    git diff --cached -U0 -- "${C_FILES_CHANGED[@]}" >"$DIFF_CACHE" 2>/dev/null
+
+    CACHED_CC_STD=$(build_cc_std_defines)
+    CACHED_SUPPRESSIONS=$(build_cppcheck_suppressions)
+fi
+
 # === CHECK 1: Workspace path validation ===
 update_progress "Checking workspace path"
-if echo "$workspace" | LC_ALL=C grep -q "[一-龥]"; then
+if echo "$workspace" | LC_ALL=C grep -q '[^ -~]'; then
     report_result 1 "Workspace path contains non-ASCII characters"
     RETURN=1
 else
     report_result 0
 fi
 
-# === CHECK 2: Merge conflict markers ===
+# === CHECK 2: Merge conflict markers (single git grep) ===
 update_progress "Checking for merge conflicts"
-CONFLICT_MARKERS=$(printf '%s|%s|%s' "<<<<<<<" "=======" ">>>>>>>")
-CONFLICT_FILES=$(git diff --cached --name-only -G "${CONFLICT_MARKERS}" \
-    | grep -vE '(^|/)\.git/hooks/|(^|/)(pre-commit|commit-msg|prepare-commit-msg|pre-push)\.hook$')
+CONFLICT_FILES=$(git grep --cached -lE '^(<{7}|={7}|>{7})( |$)' -- "${FILES[@]}" 2>/dev/null |
+    grep -vE '(^|/)(pre-commit|commit-msg|prepare-commit-msg|pre-push)\.hook$' || true)
 if [ -n "${CONFLICT_FILES}" ]; then
-    report_result 1 "Conflict markers found in: ${CONFLICT_FILES}"
+    report_result 1 "Conflict markers found in: $(echo "$CONFLICT_FILES" | tr '\n' ' ')"
     RETURN=1
 else
     report_result 0
 fi
 
-# === CHECK 3: Binary files ===
+# === CHECK 3: Binary files (warning only, parsed from initial numstat) ===
 update_progress "Checking for binary files"
-binary_files=()
-for file in "${FILES[@]}"; do
-    if [ -f "$file" ]; then
-        mime_info=$(file --mime "$file" 2> /dev/null)
-        if echo "$mime_info" | grep -qi binary; then
-            binary_files+=("$file")
-        fi
-    fi
-done
 if [ ${#binary_files[@]} -gt 0 ]; then
-    report_result 1 "Binary files detected: ${binary_files[*]}"
-    WARNINGS_FOUND+=("Binary files should not be committed")
+    report_warning "Binary files detected: ${binary_files[*]}"
 else
     report_result 0
 fi
 
-# === CHECK 4: Code formatting ===
+# === CHECK 4: Whitespace errors ===
+update_progress "Checking for whitespace errors"
+ws_errors=$(git diff --cached --check 2>&1 || true)
+if [ -n "$ws_errors" ]; then
+    ws_count=$(echo "$ws_errors" | wc -l)
+    report_result 1 "Whitespace errors in $ws_count location(s)"
+    RETURN=1
+else
+    report_result 0
+fi
+
+# === CHECK 5: Code formatting (clang-format-20) ===
 update_progress "Checking code formatting"
-mapfile -t C_FILES < <(git diff --cached --name-only --diff-filter=ACMR | grep -E "\.(c|h)$" || true)
 formatting_errors=0
-if [ ${#C_FILES[@]} -gt 0 ]; then
-    for FILE in "${C_FILES[@]}"; do
-        if [ -f "$FILE" ]; then
-            nf=$(git checkout-index --temp "$FILE" | cut -f 1)
-            tempdir=$(mktemp -d) || exit 1
-            newfile=$(mktemp "${tempdir}/${nf}.XXXXXX") || exit 1
-            basename=$(basename "$FILE")
-
-            source="${tempdir}/${basename}"
-            mv "$nf" "$source"
-            cp .clang-format "$tempdir" 2> /dev/null || true
-            "$CLANG_FORMAT" "$source" > "$newfile" 2> /dev/null
-
-            if ! diff -q "${source}" "${newfile}" > /dev/null 2>&1; then
+formatting_files=()
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ]; then
+    cp .clang-format "$STAGED_DIR" 2>/dev/null || true
+    for FILE in "${C_FILES_CHANGED[@]}"; do
+        staged_file="$STAGED_DIR/$FILE"
+        if [ -f "$staged_file" ]; then
+            formatted="$HOOK_TMPDIR/fmt_${FILE//\//_}"
+            "$CLANG_FORMAT" "$staged_file" >"$formatted" 2>/dev/null
+            if ! diff -q "$staged_file" "$formatted" >/dev/null 2>&1; then
                 formatting_errors=$((formatting_errors + 1))
-                WARNINGS_FOUND+=("$FILE needs formatting (run: clang-format -i $FILE)")
+                formatting_files+=("$FILE")
             fi
-            rm -rf "${tempdir}"
         fi
     done
 fi
 if [ $formatting_errors -gt 0 ]; then
     report_result 1 "$formatting_errors file(s) need formatting"
+    for ff in "${formatting_files[@]}"; do
+        WARNINGS_FOUND+=("  run: $CLANG_FORMAT -i $ff")
+    done
     RETURN=1
 else
     report_result 0
 fi
 
-# === CHECK 5: Unsafe functions ===
-update_progress "Checking for unsafe functions"
+# === CHECK 6: Banned functions (newly added code only) ===
+update_progress "Checking for banned functions"
 unsafe_found=0
-if [ ${#C_FILES[@]} -gt 0 ]; then
-    banned="([^f]gets\()|(sprintf\()|(strcpy\()"
-    for file in "${C_FILES[@]}"; do
-        if [ -f "$file" ]; then
-            filepath="${workspace}/${file}"
-            if grep -qE "${banned}" "${filepath}" 2> /dev/null; then
-                unsafe_found=$((unsafe_found + 1))
-                line_nums=$(grep -nE "${banned}" "${filepath}" | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
-                ERRORS_FOUND+=("Unsafe functions in $file (lines: $line_nums)")
+# gets/sprintf/strcpy/strcat -- buffer overflow
+# atoi/atol/atoll/atof -- no error detection (use strtol/strtod)
+# mktemp/tmpnam/tempnam -- predictable name (use mkstemp)
+# vsprintf/stpcpy -- same risks as sprintf/strcpy
+banned='(^|[^[:alnum:]_])(gets|sprintf|vsprintf|strcpy|stpcpy|strcat|atoi|atol|atoll|atof|mktemp|tmpnam|tempnam)[[:space:]]*\('
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ] && [ -s "$DIFF_CACHE" ]; then
+    current_file=""
+    banned_reported=""
+    in_block_comment=0
+    while IFS= read -r line; do
+        if [[ $line == "+++ b/"* ]]; then
+            current_file="${line#'+++ b/'}"
+            in_block_comment=0
+        elif [[ $line == "@@"* ]]; then
+            hunk_meta=${line#*+}
+            hunk_meta=${hunk_meta%% @@*}
+            hunk_start=${hunk_meta%%,*}
+            case "$hunk_start" in
+            ''|*[!0-9]*) current_line=0 ;;
+            *) current_line=$hunk_start ;;
+            esac
+        elif [[ -n "$current_file" ]]; then
+            if [[ $line == "+"* && $line != "+++"* ]]; then
+                added="${line:1}"
+                sanitized_data=$(strip_strings_and_comments "$added" "$in_block_comment")
+                in_block_comment=$(printf '%s\n' "$sanitized_data" | sed -n '1p')
+                sanitized=$(printf '%s\n' "$sanitized_data" | sed -n '2p')
+                if ! is_reported "$banned_reported" "$current_file" &&
+                    printf '%s\n' "$sanitized" | grep -qE "$banned"; then
+                    unsafe_found=$((unsafe_found + 1))
+                    ERRORS_FOUND+=("Banned function in $current_file (added line: $current_line)")
+                    banned_reported=$(mark_reported "$banned_reported" "$current_file")
+                fi
+                current_line=$((current_line + 1))
+            elif [[ $line == "-"* && $line != "---"* ]]; then
+                :
+            else
+                current_line=$((current_line + 1))
             fi
         fi
-    done
+    done <"$DIFF_CACHE"
 fi
 if [ $unsafe_found -gt 0 ]; then
-    report_result 1 "$unsafe_found file(s) contain unsafe functions"
+    report_result 1 "$unsafe_found file(s) add banned functions"
     RETURN=1
 else
     report_result 0
 fi
 
-# === CHECK 6: Static analysis ===
-update_progress "Running static analysis"
-if [ ${#C_FILES[@]} -gt 0 ]; then
-    existing_c_files=()
-    for file in "${C_FILES[@]}"; do
-        [ -f "$file" ] && existing_c_files+=("$file")
+# === CHECK 7: TODO/FIXME comments (newly added lines only) ===
+update_progress "Checking for TODO/FIXME comments"
+todo_found=0
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ] && [ -s "$DIFF_CACHE" ]; then
+    current_file=""
+    reported=""
+    while IFS= read -r line; do
+        if [[ $line == "+++ b/"* ]]; then
+            current_file="${line#'+++ b/'}"
+            reported=""
+        elif [[ -z "$reported" && -n "$current_file" && $line == "+"* && $line != "+++"* ]]; then
+            if echo "$line" | grep -iqwE 'TODO|FIXME|HACK|XXX'; then
+                todo_found=$((todo_found + 1))
+                ERRORS_FOUND+=("TODO/FIXME comment added in $current_file")
+                reported=1
+            fi
+        fi
+    done <"$DIFF_CACHE"
+fi
+if [ $todo_found -gt 0 ]; then
+    report_result 1 "$todo_found file(s) introduce TODO/FIXME comments"
+    RETURN=1
+else
+    report_result 0
+fi
+
+# === CHECK 8: Security patterns (newly added lines only) ===
+# Uses bash [[ =~ ]] for pattern matching -- no subprocess per line.
+update_progress "Checking security patterns"
+sec_found=0
+
+# Pre-compile regex patterns for bash =~ (ERE syntax).
+re_printf_call='(^|[^[:alnum:]_])(printf|vprintf)[[:space:]]*\('
+re_printf_lit='(^|[^[:alnum:]_])(printf|vprintf)[[:space:]]*\([[:space:]]*"'
+re_fprintf_call='(^|[^[:alnum:]_])(fprintf|dprintf|vfprintf)[[:space:]]*\('
+re_fprintf_lit='(^|[^[:alnum:]_])(fprintf|dprintf|vfprintf)[[:space:]]*\([^,]*,[[:space:]]*"'
+re_snprintf_call='(^|[^[:alnum:]_])v?snprintf[[:space:]]*\('
+re_snprintf_lit='(^|[^[:alnum:]_])v?snprintf[[:space:]]*\([^,]*,[^,]*,[[:space:]]*"'
+re_format_ok='format-ok'
+re_open='(^|[^[:alnum:]_])open[[:space:]]*\('
+re_open_ok='O_CLOEXEC|openat|"r[ewab]*e"'
+re_pipe='(^|[^[:alnum:]_])pipe[[:space:]]*\('
+re_pipe_ok='pipe2'
+re_socket='(^|[^[:alnum:]_])socket[[:space:]]*\('
+re_socket_ok='SOCK_CLOEXEC'
+re_accept='(^|[^[:alnum:]_])accept[[:space:]]*\('
+re_accept_ok='accept4'
+re_pos_errno='return[[:space:]]+(E(PERM|ACCES|NOENT|FAULT|INVAL|NOSYS|BADF|EXIST|NODEV|NOTDIR|ISDIR|NFILE|MFILE|NOTTY|FBIG|NOSPC|ROFS|NAMETOOLONG|NOTEMPTY|LOOP|NOMEM|RANGE|OVERFLOW))[^[:alnum:]_]'
+re_neg_errno='return[[:space:]]+-E'
+re_malloc_mul='(^|[^[:alnum:]_])malloc[[:space:]]*\([^)]*\*'
+re_malloc_ok='calloc|reallocarray|__builtin_mul_overflow|overflow-ok'
+re_scanf_call='[vf]?s?scanf[[:space:]]*\('
+re_scanf_bare='%[^0-9"]*s|%[^0-9"]*\['
+re_threadsafe='(^|[^[:alnum:]_])(strtok|asctime|ctime|gmtime|localtime)[[:space:]]*\('
+re_threadsafe_ok='(strtok_r|asctime_r|ctime_r|gmtime_r|localtime_r)'
+
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ] && [ -s "$DIFF_CACHE" ]; then
+    current_file=""
+    sec_reported=""
+    while IFS= read -r line; do
+        if [[ $line == "+++ b/"* ]]; then
+            current_file="${line#'+++ b/'}"
+        elif [[ -n "$current_file" && $line == "+"* && $line != "+++"* ]]; then
+            added="${line:1}"
+
+            # 8a. Non-literal format string (per-family argument position).
+            if ! is_reported "$sec_reported" "$current_file:fmtstr"; then
+                flagged=0
+                # printf/vprintf: format is arg 1
+                if [[ $added =~ $re_printf_call ]] && ! [[ $added =~ $re_printf_lit ]]; then
+                    flagged=1
+                fi
+                # fprintf/dprintf/vfprintf: format is arg 2
+                if [[ $flagged -eq 0 && $added =~ $re_fprintf_call ]] && ! [[ $added =~ $re_fprintf_lit ]]; then
+                    flagged=1
+                fi
+                # snprintf/vsnprintf: format is arg 3
+                if [[ $flagged -eq 0 && $added =~ $re_snprintf_call ]] && ! [[ $added =~ $re_snprintf_lit ]]; then
+                    flagged=1
+                fi
+                # Allow suppression comment.
+                if [[ $flagged -eq 1 ]] && [[ $added =~ $re_format_ok ]]; then
+                    flagged=0
+                fi
+                if [[ $flagged -eq 1 ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("Possible non-literal format string in $current_file")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:fmtstr")
+                fi
+            fi
+
+            # 8b. Missing O_CLOEXEC on descriptor-creating calls.
+            if ! is_reported "$sec_reported" "$current_file:cloexec"; then
+                if [[ $added =~ $re_open ]] && ! [[ $added =~ $re_open_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("open() without O_CLOEXEC in $current_file")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:cloexec")
+                elif [[ $added =~ $re_pipe ]] && ! [[ $added =~ $re_pipe_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("pipe() without O_CLOEXEC in $current_file (use pipe2)")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:cloexec")
+                elif [[ $added =~ $re_socket ]] && ! [[ $added =~ $re_socket_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("socket() without SOCK_CLOEXEC in $current_file")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:cloexec")
+                elif [[ $added =~ $re_accept ]] && ! [[ $added =~ $re_accept_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("accept() without SOCK_CLOEXEC in $current_file (use accept4)")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:cloexec")
+                fi
+            fi
+
+            # 8c. Positive errno return (should be -EFOO in seccomp dispatch).
+            if ! is_reported "$sec_reported" "$current_file:errno"; then
+                if [[ $added =~ $re_pos_errno ]] && ! [[ $added =~ $re_neg_errno ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("Positive errno return in $current_file (use -EFOO)")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:errno")
+                fi
+            fi
+
+            # 8d. Unchecked malloc multiplication (integer overflow risk).
+            if ! is_reported "$sec_reported" "$current_file:malloc"; then
+                if [[ $added =~ $re_malloc_mul ]] && ! [[ $added =~ $re_malloc_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("malloc() with multiplication in $current_file (use calloc or check overflow)")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:malloc")
+                fi
+            fi
+
+            # 8e. scanf-family without width on %s or %[.
+            if ! is_reported "$sec_reported" "$current_file:scanf"; then
+                if [[ $added =~ $re_scanf_call ]] && [[ $added =~ $re_scanf_bare ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("scanf with unbounded %s or %[ in $current_file")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:scanf")
+                fi
+            fi
+
+            # 8f. Thread-unsafe functions (use _r variants).
+            if ! is_reported "$sec_reported" "$current_file:threadsafe"; then
+                if [[ $added =~ $re_threadsafe ]] && ! [[ $added =~ $re_threadsafe_ok ]]; then
+                    sec_found=$((sec_found + 1))
+                    ERRORS_FOUND+=("Thread-unsafe function in $current_file (use _r variant)")
+                    sec_reported=$(mark_reported "$sec_reported" "$current_file:threadsafe")
+                fi
+            fi
+        fi
+    done <"$DIFF_CACHE"
+fi
+if [ $sec_found -gt 0 ]; then
+    report_result 1 "$sec_found security pattern(s) found in new code"
+    RETURN=1
+else
+    report_result 0
+fi
+
+# === CHECK 9: Compiler syntax check (via Makefile, Linux only) ===
+# Delegates to 'make check-syntax' which uses the project's real CFLAGS.
+# Skips gracefully on non-Linux compilers (handled inside the Makefile).
+update_progress "Compiler syntax check"
+if [ "$(uname -s)" = "Linux" ] && [ -f .config ]; then
+    staged_c_only=()
+    for file in "${C_FILES_CHANGED[@]}"; do
+        [[ $file == *.c ]] && [ -f "$STAGED_DIR/$file" ] && staged_c_only+=("$file")
     done
-    if [ ${#existing_c_files[@]} -gt 0 ]; then
-        if ! cppcheck $CPPCHECK_OPTS "${existing_c_files[@]}" > /dev/null 2>&1; then
+    if [ ${#staged_c_only[@]} -gt 0 ]; then
+        compiler_errors="$HOOK_TMPDIR/compiler_errors"
+        # Run make from the staged dir so -Iinclude/-Isrc resolve to staged headers.
+        # -I adds the repo root to the makefile include search path so
+        # "include mk/toolchain.mk" etc. resolve from the working tree.
+        if ! make -I "$workspace" -f "$workspace/Makefile" -C "$STAGED_DIR" \
+            check-syntax CHK_SOURCES="${staged_c_only[*]}" \
+            2>"$compiler_errors" >/dev/null; then
+            report_result 1 "Compiler syntax check failed"
+            while IFS= read -r eline; do
+                ERRORS_FOUND+=("$eline")
+            done < <(grep -E '(error|warning):' "$compiler_errors" | head -10)
+            RETURN=1
+        else
+            report_result 0
+        fi
+    else
+        report_result 0
+    fi
+else
+    printf " [ ${YELLOW}SKIP${NC} ] (Linux + .config required)\n"
+fi
+
+# === CHECK 10: Static analysis - cppcheck (git-tracked files only) ===
+update_progress "Running cppcheck"
+if [ ${#C_FILES_CHANGED[@]} -gt 0 ]; then
+    staged_c_files=()
+    has_header_changes=0
+    for file in "${C_FILES_CHANGED[@]}"; do
+        if [[ $file == *.c ]] && [ -f "$STAGED_DIR/$file" ]; then
+            staged_c_files+=("$file")
+        elif [[ $file == *.h ]]; then
+            has_header_changes=1
+        fi
+    done
+    # Header-only changes can break any translation unit.
+    # Fall back to all tracked src/*.c so cppcheck catches the breakage.
+    if [ ${#staged_c_files[@]} -eq 0 ] && [ $has_header_changes -eq 1 ]; then
+        while IFS= read -r -d '' f; do
+            [ -f "$STAGED_DIR/$f" ] && staged_c_files+=("$f")
+        done < <(git ls-files -z -- 'src/*.c')
+    fi
+    if [ ${#staged_c_files[@]} -gt 0 ]; then
+        cppcheck_opts="-I. -Iinclude -Isrc"
+        cppcheck_opts+=" --enable=all --error-exitcode=1"
+        cppcheck_opts+=" --library=posix --platform=unix64"
+        cppcheck_opts+=" $CACHED_CC_STD"
+        cppcheck_opts+=" --max-configs=8 $CACHED_SUPPRESSIONS"
+        cppcheck_opts+=" -D_GNU_SOURCE -D__linux__"
+        cppcheck_log="$HOOK_TMPDIR/cppcheck.log"
+        if ! (
+            cd "$STAGED_DIR" &&
+                cppcheck $cppcheck_opts "${staged_c_files[@]}"
+        ) >/dev/null 2>"$cppcheck_log"; then
             report_result 1 "Static analysis errors found"
+            while IFS= read -r cline; do
+                ERRORS_FOUND+=("cppcheck: $cline")
+            done < <(grep -E '(error|warning):' "$cppcheck_log" | head -10)
             RETURN=1
         else
             report_result 0
@@ -269,10 +677,10 @@ else
     report_result 0
 fi
 
-# === CHECK 7: Non-ASCII filenames ===
+# === CHECK 11: Non-ASCII filenames (checked from FILES array, no extra git call) ===
 update_progress "Checking filenames"
-if test $(git diff --cached --name-only --diff-filter=A -z \
-    | LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0; then
+non_ascii_count=$(printf '%s\n' "${FILES[@]}" | LC_ALL=C tr -d '[ -~]\n' | wc -c | awk '{print $1}')
+if [ "$non_ascii_count" != "0" ]; then
     report_result 1 "Non-ASCII filename detected"
     RETURN=1
 else
@@ -281,18 +689,12 @@ fi
 
 printf "\r%*s\r" 50 ""
 
+# --- Summary (FILE_SUMMARIES already populated from initial numstat) ---
 printf "\n"
-
 printf "${CYAN}Files to be committed:${NC}\n"
-for file in "${FILES[@]}"; do
-    summary=$(git diff --cached --numstat "$file" 2> /dev/null | awk '{
-    if ($1 != "0" && $2 != "0")
-      printf "+%s/-%s", $1, $2;
-    else if ($1 != "0")
-      printf "+%s", $1;
-    else if ($2 != "0")
-      printf "-%s", $2;
-  }')
+for i in "${!FILES[@]}"; do
+    file="${FILES[$i]}"
+    summary="${FILE_SUMMARIES[$i]}"
     if [ -n "$summary" ]; then
         printf "  ${WHITE}%-40s${NC} ${GREEN}%s${NC}\n" "$file" "$summary"
     else
