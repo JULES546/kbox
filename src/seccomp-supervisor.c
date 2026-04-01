@@ -603,6 +603,12 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
     /* 4b. Set up supervisor context. */
     kbox_fd_table_init(&fd_table);
 
+    /* Register stdio (0, 1, 2) as host-passthrough FDs so the EBADF policy
+     * for untracked FDs does not block inherited terminal/pipe I/O.
+     */
+    for (int i = 0; i < 3; i++)
+        kbox_fd_table_insert_at(&fd_table, i, KBOX_LKL_FD_SHADOW_ONLY, 0);
+
     memset(&ctx, 0, sizeof(ctx));
     ctx.sysnrs = sysnrs;
     ctx.host_nrs = host_nrs;

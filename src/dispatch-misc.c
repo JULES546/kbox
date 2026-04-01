@@ -11,6 +11,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -183,6 +186,12 @@ struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
     /* Supervisor copies no longer needed; tracee owns its own copies. */
     close(host_pipefd[0]);
     close(host_pipefd[1]);
+
+    /* Track both pipe FDs as host-passthrough so I/O handlers CONTINUE them
+     * instead of returning EBADF.
+     */
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd0);
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd1);
 
     int guest_fds[2] = {tracee_fd0, tracee_fd1};
     int wrc =
@@ -413,8 +422,11 @@ struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
@@ -498,8 +510,11 @@ static struct kbox_dispatch dispatch_iov_transfer(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
 
     if (is_write)
         invalidate_stat_cache_fd(ctx, lkl_fd);
@@ -610,8 +625,11 @@ struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
@@ -631,8 +649,11 @@ struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
@@ -655,8 +676,11 @@ struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
 
     long operation = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long ret = kbox_lkl_flock(ctx->sysnrs, lkl_fd, operation);
@@ -670,8 +694,11 @@ struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->shadow_writeback) {
         int rc = sync_shadow_writeback(ctx, entry);
         if (rc < 0)
@@ -690,8 +717,11 @@ struct kbox_dispatch forward_fdatasync(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->shadow_writeback) {
         int rc = sync_shadow_writeback(ctx, entry);
         if (rc < 0)
@@ -852,16 +882,24 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
     long cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd < 0) {
-        /* Host FD (stdin/stdout/stderr or pipe). Most ioctls pass through to
-         * the host kernel. However, job-control ioctls (TIOCSPGRP/TIOCGPGRP)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* Host-passthrough FD (stdin/stdout/stderr, pipe, eventfd, etc.).
+         * Most ioctls pass through to the host kernel.  Job-control ioctls
          * fail with EPERM under seccomp-unotify because the supervised child
-         * is not the session leader. Return ENOTTY so shells fall back to
+         * is not the session leader.  Return ENOTTY so shells fall back to
          * non-job-control mode instead of aborting.
          */
         if (cmd == TIOCSPGRP || cmd == TIOCGPGRP || cmd == TIOCSCTTY)
             return kbox_dispatch_errno(ENOTTY);
         return kbox_dispatch_continue();
+    }
+    if (lkl_fd < 0) {
+        if (!fd_should_deny_io(fd, lkl_fd)) {
+            if (cmd == TIOCSPGRP || cmd == TIOCGPGRP || cmd == TIOCSCTTY)
+                return kbox_dispatch_errno(ENOTTY);
+            return kbox_dispatch_continue();
+        }
+        return kbox_dispatch_errno(EBADF);
     }
 
     /* For virtual FDs backed by LKL, terminal ioctls yield -ENOTTY since LKL
@@ -869,4 +907,82 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
      * -ENOTTY, matching regular-file semantics.
      */
     return kbox_dispatch_errno(ENOTTY);
+}
+
+/* Intercepted FD-creating syscalls: eventfd, timerfd_create, epoll_create1.
+ *
+ * Previously these went through CONTINUE, leaving their FDs untracked. That
+ * allowed read/write on leaked host FDs to also CONTINUE. Now we create the
+ * FD in the supervisor, inject it via ADDFD, and track it as host-passthrough
+ * so the EBADF policy for untracked FDs does not break legitimate I/O.
+ */
+
+struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    unsigned int initval = (unsigned int) kbox_syscall_request_arg(req, 0);
+    int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 1));
+
+    int host_fd = eventfd(initval, flags & ~EFD_CLOEXEC);
+    if (host_fd < 0)
+        return kbox_dispatch_errno(errno);
+
+    uint32_t addfd_flags = (flags & EFD_CLOEXEC) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
+    close(host_fd);
+    if (tracee_fd < 0)
+        return kbox_dispatch_errno(-tracee_fd);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (flags & EFD_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+
+    return kbox_dispatch_value(tracee_fd);
+}
+
+struct kbox_dispatch forward_timerfd_create(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    int clockid = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 1));
+
+    int host_fd = timerfd_create(clockid, flags & ~TFD_CLOEXEC);
+    if (host_fd < 0)
+        return kbox_dispatch_errno(errno);
+
+    uint32_t addfd_flags = (flags & TFD_CLOEXEC) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
+    close(host_fd);
+    if (tracee_fd < 0)
+        return kbox_dispatch_errno(-tracee_fd);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (flags & TFD_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+
+    return kbox_dispatch_value(tracee_fd);
+}
+
+struct kbox_dispatch forward_epoll_create1(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
+
+    int host_fd = epoll_create1(flags & ~EPOLL_CLOEXEC);
+    if (host_fd < 0)
+        return kbox_dispatch_errno(errno);
+
+    uint32_t addfd_flags = (flags & EPOLL_CLOEXEC) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
+    close(host_fd);
+    if (tracee_fd < 0)
+        return kbox_dispatch_errno(-tracee_fd);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (flags & EPOLL_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+
+    return kbox_dispatch_value(tracee_fd);
 }

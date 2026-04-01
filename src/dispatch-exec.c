@@ -89,6 +89,11 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
         return kbox_dispatch_continue();
 
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (lkl_fd >= 0) {
         long host = kbox_fd_table_get_host_fd(ctx->fd_table, fd);
         if (host == -1) {

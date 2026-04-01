@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -24,6 +25,25 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
+
+/* pidfd_getfd is used to obtain a supervisor copy of a tracee FD that shares
+ * the same file description (needed for emulating dup on host-passthrough FDs).
+ * Available since Linux 5.6; kbox requires 5.13+ for seccomp USER_NOTIF.
+ */
+#ifndef __NR_pidfd_open
+#if defined(__x86_64__)
+#define __NR_pidfd_open 434
+#elif defined(__aarch64__)
+#define __NR_pidfd_open 434
+#endif
+#endif
+#ifndef __NR_pidfd_getfd
+#if defined(__x86_64__)
+#define __NR_pidfd_getfd 438
+#elif defined(__aarch64__)
+#define __NR_pidfd_getfd 438
+#endif
+#endif
 
 #include "dispatch-internal.h"
 #include "fd-table.h"
@@ -1463,8 +1483,11 @@ static struct kbox_dispatch forward_getdents_common(
     long ret;
     int wrc;
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (count_raw < 0)
         return kbox_dispatch_errno(EINVAL);
 
@@ -1493,6 +1516,88 @@ static struct kbox_dispatch forward_getdents_common(
     return kbox_dispatch_value((int64_t) n);
 }
 
+static int dup_tracee_fd(pid_t pid, int tracee_fd);
+
+/* Gate a CONTINUE syscall that takes an FD in arg0.  Deny if the FD is
+ * untracked and in a blocked range; otherwise let the host kernel handle it.
+ */
+static struct kbox_dispatch forward_fd_gated_continue(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (fd_should_deny_io(fd, lkl_fd))
+        return kbox_dispatch_errno(EBADF);
+    return kbox_dispatch_continue();
+}
+
+/* Gate epoll_ctl: two FD args (epfd=arg0, fd=arg2). */
+static struct kbox_dispatch forward_epoll_ctl_gated(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    long epfd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    long lkl_ep = kbox_fd_table_get_lkl(ctx->fd_table, epfd);
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (fd_should_deny_io(epfd, lkl_ep) || fd_should_deny_io(fd, lkl_fd))
+        return kbox_dispatch_errno(EBADF);
+    return kbox_dispatch_continue();
+}
+
+/* Emulate an open that would otherwise CONTINUE to the host kernel, tracking
+ * the resulting FD as host-passthrough.  The supervisor opens the file in its
+ * own namespace, injects the FD into the tracee via ADDFD, and records it in
+ * the FD table.  For /proc/self paths, the supervisor translates to
+ * /proc/{pid} so the opened file reflects the tracee, not the supervisor.
+ *
+ * supervisor_dirfd: AT_FDCWD for absolute paths, or a supervisor-owned copy
+ *                   of the tracee's dirfd (caller must close after return).
+ */
+static struct kbox_dispatch emulate_host_open_tracked(
+    struct kbox_supervisor_ctx *ctx,
+    const struct kbox_syscall_request *req,
+    int supervisor_dirfd,
+    const char *path,
+    int host_flags,
+    mode_t mode)
+{
+    /* Translate /proc/self → /proc/{pid} so the supervisor opens the
+     * tracee's proc entry rather than its own.
+     */
+    char sv_path[KBOX_MAX_PATH];
+    pid_t pid = kbox_syscall_request_pid(req);
+    if (strncmp(path, "/proc/thread-self/", 18) == 0)
+        snprintf(sv_path, sizeof(sv_path), "/proc/%d/task/%d/%s", (int) pid,
+                 (int) pid, path + 18);
+    else if (strcmp(path, "/proc/thread-self") == 0)
+        snprintf(sv_path, sizeof(sv_path), "/proc/%d/task/%d", (int) pid,
+                 (int) pid);
+    else if (strncmp(path, "/proc/self/", 11) == 0)
+        snprintf(sv_path, sizeof(sv_path), "/proc/%d/%s", (int) pid, path + 11);
+    else if (strcmp(path, "/proc/self") == 0)
+        snprintf(sv_path, sizeof(sv_path), "/proc/%d", (int) pid);
+    else
+        snprintf(sv_path, sizeof(sv_path), "%s", path);
+
+    int host_fd =
+        openat(supervisor_dirfd, sv_path, host_flags & ~O_CLOEXEC, mode);
+    if (host_fd < 0)
+        return kbox_dispatch_errno(errno);
+
+    uint32_t af = (host_flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, af);
+    close(host_fd);
+    if (tracee_fd < 0)
+        return kbox_dispatch_errno(-tracee_fd);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (host_flags & O_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+    return kbox_dispatch_value(tracee_fd);
+}
+
 /* forward_openat. */
 
 static struct kbox_dispatch forward_openat(
@@ -1506,17 +1611,27 @@ static struct kbox_dispatch forward_openat(
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
-    long flags =
-        host_to_lkl_open_flags(to_c_long_arg(kbox_syscall_request_arg(req, 2)));
+    long host_flags_raw = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    long flags = host_to_lkl_open_flags(host_flags_raw);
     long mode = to_c_long_arg(kbox_syscall_request_arg(req, 3));
 
-    if (should_continue_virtual_path(ctx, req, 1, translated))
-        return kbox_dispatch_continue();
-    if (kbox_is_tty_like_path(translated))
-        return kbox_dispatch_continue();
+    if (should_continue_virtual_path(ctx, req, 1, translated) ||
+        kbox_is_tty_like_path(translated))
+        return emulate_host_open_tracked(ctx, req, AT_FDCWD, translated,
+                                         (int) host_flags_raw, (mode_t) mode);
 
-    if (should_continue_for_dirfd(lkl_dirfd))
-        return kbox_dispatch_continue();
+    if (should_continue_for_dirfd(lkl_dirfd)) {
+        long raw_dirfd = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
+        int sv_dirfd =
+            dup_tracee_fd(kbox_syscall_request_pid(req), (int) raw_dirfd);
+        if (sv_dirfd < 0)
+            return kbox_dispatch_errno(-sv_dirfd);
+        struct kbox_dispatch d =
+            emulate_host_open_tracked(ctx, req, sv_dirfd, translated,
+                                      (int) host_flags_raw, (mode_t) mode);
+        close(sv_dirfd);
+        return d;
+    }
 
     {
         struct kbox_dispatch cached_dispatch;
@@ -1552,15 +1667,27 @@ static struct kbox_dispatch forward_openat2(
                                  kbox_syscall_request_arg(req, 3), &how);
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
+    long host_flags2_raw = (long) how.flags;
     how.flags = (uint64_t) host_to_lkl_open_flags((long) how.flags);
 
-    if (should_continue_virtual_path(ctx, req, 1, translated))
-        return kbox_dispatch_continue();
-    if (kbox_is_tty_like_path(translated))
-        return kbox_dispatch_continue();
+    if (should_continue_virtual_path(ctx, req, 1, translated) ||
+        kbox_is_tty_like_path(translated))
+        return emulate_host_open_tracked(ctx, req, AT_FDCWD, translated,
+                                         (int) host_flags2_raw,
+                                         (mode_t) how.mode);
 
-    if (should_continue_for_dirfd(lkl_dirfd))
-        return kbox_dispatch_continue();
+    if (should_continue_for_dirfd(lkl_dirfd)) {
+        long raw_dirfd = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
+        int sv_dirfd =
+            dup_tracee_fd(kbox_syscall_request_pid(req), (int) raw_dirfd);
+        if (sv_dirfd < 0)
+            return kbox_dispatch_errno(-sv_dirfd);
+        struct kbox_dispatch d =
+            emulate_host_open_tracked(ctx, req, sv_dirfd, translated,
+                                      (int) host_flags2_raw, (mode_t) how.mode);
+        close(sv_dirfd);
+        return d;
+    }
 
     if (((long) how.flags & O_ACCMODE) == O_RDONLY) {
         struct kbox_dispatch cached_dispatch;
@@ -1599,14 +1726,15 @@ static struct kbox_dispatch forward_open_legacy(
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
-    long flags =
-        host_to_lkl_open_flags(to_c_long_arg(kbox_syscall_request_arg(req, 1)));
+    long host_flags_legacy = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    long flags = host_to_lkl_open_flags(host_flags_legacy);
     long mode = to_c_long_arg(kbox_syscall_request_arg(req, 2));
 
-    if (should_continue_virtual_path(ctx, req, 0, translated))
-        return kbox_dispatch_continue();
-    if (kbox_is_tty_like_path(translated))
-        return kbox_dispatch_continue();
+    if (should_continue_virtual_path(ctx, req, 0, translated) ||
+        kbox_is_tty_like_path(translated))
+        return emulate_host_open_tracked(ctx, req, AT_FDCWD, translated,
+                                         (int) host_flags_legacy,
+                                         (mode_t) mode);
 
     {
         struct kbox_dispatch cached_dispatch;
@@ -1680,9 +1808,18 @@ static struct kbox_dispatch forward_close(
     if (lkl_fd >= 0)
         invalidate_stat_cache_fd(ctx, lkl_fd);
 
-    if (entry && entry->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY &&
-        entry->shadow_sp >= 0) {
-        kbox_fd_table_remove(ctx->fd_table, fd);
+    if (entry && entry->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* Host-passthrough FDs (pipes, eventfds, stdio): the host kernel
+         * tracks per-process FD lifecycle, so close via CONTINUE is correct.
+         * Keep the FD table entry alive because the table is shared across
+         * all supervised processes (parent + children after fork).  If the
+         * child closes a pipe FD, the entry must remain so the parent (or
+         * a sibling) that still holds the same FD number isn't denied.
+         * Shadow socket entries (shadow_sp >= 0) hold supervisor resources
+         * that must be released, so those are still removed.
+         */
+        if (entry->shadow_sp >= 0)
+            kbox_fd_table_remove(ctx->fd_table, fd);
         return kbox_dispatch_continue();
     }
 
@@ -1738,6 +1875,10 @@ static struct kbox_dispatch forward_close(
                 if (ctx->fd_table->entries[i].lkl_fd == lkl)
                     still_ref = 1;
             }
+            for (long i = 0; i < KBOX_MID_FD_MAX && !still_ref; i++) {
+                if (ctx->fd_table->mid_fds[i].lkl_fd == lkl)
+                    still_ref = 1;
+            }
             for (long i = 0; i < KBOX_LOW_FD_MAX && !still_ref; i++) {
                 if (ctx->fd_table->low_fds[i].lkl_fd == lkl)
                     still_ref = 1;
@@ -1762,8 +1903,11 @@ static struct kbox_dispatch forward_read_like(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     {
         struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
         if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
@@ -1856,8 +2000,11 @@ static struct kbox_dispatch forward_write(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
@@ -1964,14 +2111,19 @@ static struct kbox_dispatch forward_sendfile(
             out_lkl = kbox_fd_table_get_lkl(ctx->fd_table, vfd);
     }
 
-    /* Both FDs are host-visible (shadow memfds, stdio, pipes, etc.) and
-     * neither has LKL backing.  The host kernel handles sendfile.
+    /* Both FDs have no LKL backing: the host kernel handles sendfile
+     * if both are known host FDs. Deny if either is in a denied range.
      */
-    if (in_lkl < 0 && out_lkl < 0)
+    if (in_lkl < 0 && out_lkl < 0) {
+        if (fd_should_deny_io(in_fd, in_lkl) ||
+            fd_should_deny_io(out_fd, out_lkl))
+            return kbox_dispatch_errno(EBADF);
         return kbox_dispatch_continue();
+    }
 
     /* At least one FD is virtual/LKL-backed: emulate via read + write.
-     * Source must have an LKL FD for emulation.
+     * Source must have an LKL FD for emulation; host-passthrough sources
+     * cannot be read via LKL.
      */
     if (in_lkl < 0)
         return kbox_dispatch_errno(EBADF);
@@ -2066,8 +2218,11 @@ static struct kbox_dispatch forward_lseek(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     {
         struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
         if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
@@ -2094,6 +2249,10 @@ static struct kbox_dispatch forward_lseek(
     return kbox_dispatch_from_lkl(ret);
 }
 
+static int find_available_tracee_fd(pid_t pid, int minfd);
+static void cleanup_replaced_fd_tracking(struct kbox_supervisor_ctx *ctx,
+                                         long fd);
+
 /* forward_fcntl. */
 
 static struct kbox_dispatch forward_fcntl(
@@ -2102,6 +2261,44 @@ static struct kbox_dispatch forward_fcntl(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        long pt_cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+        if (pt_cmd == F_DUPFD || pt_cmd == F_DUPFD_CLOEXEC) {
+            /* Emulate F_DUPFD on host-passthrough FD: get a supervisor copy
+             * via pidfd_getfd, inject at the first free tracee FD >= minfd,
+             * and track the result.
+             */
+            long minfd = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+            uint32_t af = (pt_cmd == F_DUPFD_CLOEXEC) ? O_CLOEXEC : 0;
+            int target_fd;
+
+            if (minfd < 0)
+                return kbox_dispatch_errno(EINVAL);
+            target_fd = find_available_tracee_fd(kbox_syscall_request_pid(req),
+                                                 (int) minfd);
+            if (target_fd < 0)
+                return kbox_dispatch_errno(-target_fd);
+
+            int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) fd);
+            if (copy < 0)
+                return kbox_dispatch_errno(-copy);
+            int tracee_new = request_addfd_at(ctx, req, copy, target_fd, af);
+            close(copy);
+            if (tracee_new < 0)
+                return kbox_dispatch_errno(-tracee_new);
+            track_host_passthrough_fd(ctx->fd_table, tracee_new);
+            if (pt_cmd == F_DUPFD_CLOEXEC)
+                kbox_fd_table_set_cloexec(ctx->fd_table, tracee_new, 1);
+            return kbox_dispatch_value(tracee_new);
+        }
+        if (pt_cmd == F_SETFD) {
+            long carg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+            kbox_fd_table_set_cloexec(ctx->fd_table, fd,
+                                      (carg & FD_CLOEXEC) ? 1 : 0);
+        }
+        return kbox_dispatch_continue();
+    }
 
     if (lkl_fd < 0) {
         /* Shadow socket: handle F_DUPFD* and F_SETFL. */
@@ -2116,11 +2313,8 @@ static struct kbox_dispatch forward_fcntl(
                  */
                 struct kbox_fd_entry *orig = NULL;
                 if (minfd > 0)
-                    goto fcntl_continue;
-                if (svfd >= KBOX_FD_BASE)
-                    orig = &ctx->fd_table->entries[svfd - KBOX_FD_BASE];
-                else if (svfd < KBOX_LOW_FD_MAX)
-                    orig = &ctx->fd_table->low_fds[svfd];
+                    goto fcntl_shadow_continue;
+                orig = fd_table_entry(ctx->fd_table, svfd);
                 if (orig && orig->shadow_sp >= 0) {
                     uint32_t af = (scmd == F_DUPFD_CLOEXEC) ? O_CLOEXEC : 0;
                     int nh = request_addfd(ctx, req, orig->shadow_sp, af);
@@ -2133,10 +2327,7 @@ static struct kbox_dispatch forward_fcntl(
                         int ns = dup(orig->shadow_sp);
                         if (ns >= 0) {
                             struct kbox_fd_entry *ne = NULL;
-                            if (nv >= KBOX_FD_BASE)
-                                ne = &ctx->fd_table->entries[nv - KBOX_FD_BASE];
-                            else if (nv < KBOX_LOW_FD_MAX)
-                                ne = &ctx->fd_table->low_fds[nv];
+                            ne = fd_table_entry(ctx->fd_table, nv);
                             if (ne) {
                                 ne->shadow_sp = ns;
                                 if (scmd == F_DUPFD_CLOEXEC)
@@ -2161,8 +2352,12 @@ static struct kbox_dispatch forward_fcntl(
                 kbox_fd_table_set_cloexec(ctx->fd_table, svfd,
                                           (sarg & FD_CLOEXEC) ? 1 : 0);
             }
+            goto fcntl_shadow_continue;
         }
-    fcntl_continue:
+        if (!fd_should_deny_io(fd, lkl_fd))
+            goto fcntl_shadow_continue;
+        return kbox_dispatch_errno(EBADF);
+    fcntl_shadow_continue:
         return kbox_dispatch_continue();
     }
 
@@ -2198,6 +2393,102 @@ static struct kbox_dispatch forward_fcntl(
     return kbox_dispatch_from_lkl(ret);
 }
 
+/* Obtain a supervisor-side copy of a tracee FD that shares the same file
+ * description.  Uses pidfd_getfd (Linux 5.6+) which preserves the file
+ * description identity (same position, flags, etc.) -- unlike
+ * open(/proc/pid/fd/N) which creates a new description.
+ * Returns a supervisor FD on success, -errno on failure.
+ */
+static int dup_tracee_fd(pid_t pid, int tracee_fd)
+{
+    int pidfd = (int) syscall(__NR_pidfd_open, (int) pid, (unsigned int) 0);
+    if (pidfd < 0)
+        return -errno;
+    int copy = (int) syscall(__NR_pidfd_getfd, pidfd, (unsigned int) tracee_fd,
+                             (unsigned int) 0);
+    int saved_errno = errno;
+    close(pidfd);
+    if (copy < 0)
+        return -saved_errno;
+    return copy;
+}
+
+static int find_available_tracee_fd(pid_t pid, int minfd)
+{
+    const int limit = 65536;
+    int pidfd;
+
+    if (minfd < 0)
+        return -EINVAL;
+    if (minfd >= limit)
+        return -EINVAL;
+
+    pidfd = (int) syscall(__NR_pidfd_open, (int) pid, (unsigned int) 0);
+    if (pidfd < 0)
+        return -errno;
+
+    for (int candidate = minfd; candidate < limit; candidate++) {
+        int probe = (int) syscall(__NR_pidfd_getfd, pidfd,
+                                  (unsigned int) candidate, (unsigned int) 0);
+        if (probe >= 0) {
+            close(probe);
+            continue;
+        }
+        if (errno == EBADF) {
+            close(pidfd);
+            return candidate;
+        }
+        {
+            int saved_errno = errno;
+            close(pidfd);
+            return -saved_errno;
+        }
+    }
+
+    close(pidfd);
+    return -EMFILE;
+}
+
+static void cleanup_replaced_fd_tracking(struct kbox_supervisor_ctx *ctx,
+                                         long fd)
+{
+    long stale_lkl;
+    long shadow_vfd;
+
+    if (!ctx || !ctx->fd_table)
+        return;
+
+    stale_lkl = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (stale_lkl >= 0) {
+        lkl_close_and_invalidate(ctx, stale_lkl);
+        kbox_fd_table_remove(ctx->fd_table, fd);
+    } else if (stale_lkl == KBOX_LKL_FD_SHADOW_ONLY) {
+        kbox_fd_table_remove(ctx->fd_table, fd);
+    }
+
+    shadow_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+    if (shadow_vfd >= 0) {
+        long shadow_lkl = kbox_fd_table_get_lkl(ctx->fd_table, shadow_vfd);
+        kbox_fd_table_remove(ctx->fd_table, shadow_vfd);
+        if (shadow_lkl >= 0) {
+            int ref = 0;
+            for (long j = 0; j < KBOX_FD_TABLE_MAX && !ref; j++)
+                if (ctx->fd_table->entries[j].lkl_fd == shadow_lkl)
+                    ref = 1;
+            for (long j = 0; j < KBOX_MID_FD_MAX && !ref; j++)
+                if (ctx->fd_table->mid_fds[j].lkl_fd == shadow_lkl)
+                    ref = 1;
+            for (long j = 0; j < KBOX_LOW_FD_MAX && !ref; j++)
+                if (ctx->fd_table->low_fds[j].lkl_fd == shadow_lkl)
+                    ref = 1;
+            if (!ref) {
+                kbox_net_deregister_socket((int) shadow_lkl);
+                lkl_close_and_invalidate(ctx, shadow_lkl);
+            }
+        }
+    }
+}
+
 /* forward_dup. */
 
 static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
@@ -2206,20 +2497,36 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* Emulate dup on a host-passthrough FD (pipe, stdio, eventfd, etc.)
+         * by obtaining a supervisor copy via pidfd_getfd, injecting it into
+         * the tracee via ADDFD, and tracking the result.
+         */
+        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) fd);
+        if (copy < 0)
+            return kbox_dispatch_errno(-copy);
+        int tracee_fd = request_addfd(ctx, req, copy, 0);
+        close(copy);
+        if (tracee_fd < 0)
+            return kbox_dispatch_errno(-tracee_fd);
+        track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+        return kbox_dispatch_value(tracee_fd);
+    }
+
     if (lkl_fd < 0) {
         /* Check for shadow socket (tracee holds host_fd from ADDFD). */
         long orig_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
-        if (orig_vfd < 0)
-            return kbox_dispatch_continue();
+        if (orig_vfd < 0) {
+            if (!fd_should_deny_io(fd, lkl_fd))
+                return kbox_dispatch_continue();
+            return kbox_dispatch_errno(EBADF);
+        }
 
         /* Shadow socket dup: inject a new copy of the socketpair end into
          * the tracee and track the new host_fd.
          */
         struct kbox_fd_entry *orig = NULL;
-        if (orig_vfd >= KBOX_FD_BASE)
-            orig = &ctx->fd_table->entries[orig_vfd - KBOX_FD_BASE];
-        else if (orig_vfd < KBOX_LOW_FD_MAX)
-            orig = &ctx->fd_table->low_fds[orig_vfd];
+        orig = fd_table_entry(ctx->fd_table, orig_vfd);
         if (!orig || orig->shadow_sp < 0)
             return kbox_dispatch_continue();
 
@@ -2241,11 +2548,7 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
         /* Propagate shadow_sp so chained dups work. */
         int new_sp = dup(orig->shadow_sp);
         if (new_sp >= 0) {
-            struct kbox_fd_entry *ne = NULL;
-            if (new_vfd >= KBOX_FD_BASE)
-                ne = &ctx->fd_table->entries[new_vfd - KBOX_FD_BASE];
-            else if (new_vfd < KBOX_LOW_FD_MAX)
-                ne = &ctx->fd_table->low_fds[new_vfd];
+            struct kbox_fd_entry *ne = fd_table_entry(ctx->fd_table, new_vfd);
             if (ne)
                 ne->shadow_sp = new_sp;
             else
@@ -2276,6 +2579,26 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
     long newfd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
 
     long lkl_old = kbox_fd_table_get_lkl(ctx->fd_table, oldfd);
+
+    if (lkl_old == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* Emulate dup2 on a host-passthrough FD. Use pidfd_getfd to get
+         * a supervisor copy sharing the same file description, then inject
+         * at the target FD via ADDFD_AT.
+         */
+        if (oldfd == newfd)
+            return kbox_dispatch_value((int64_t) newfd);
+        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) oldfd);
+        if (copy < 0)
+            return kbox_dispatch_errno(-copy);
+        int injected = request_addfd_at(ctx, req, copy, (int) newfd, 0);
+        close(copy);
+        if (injected < 0)
+            return kbox_dispatch_errno(-injected);
+        cleanup_replaced_fd_tracking(ctx, newfd);
+        track_host_passthrough_fd(ctx->fd_table, newfd);
+        return kbox_dispatch_value((int64_t) newfd);
+    }
+
     if (lkl_old < 0) {
         /* Shadow socket dup2: dup2(fd, fd) must return fd unchanged. */
         if (oldfd == newfd)
@@ -2283,11 +2606,8 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
 
         long orig_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, oldfd);
         if (orig_vfd >= 0) {
-            struct kbox_fd_entry *orig = NULL;
-            if (orig_vfd >= KBOX_FD_BASE)
-                orig = &ctx->fd_table->entries[orig_vfd - KBOX_FD_BASE];
-            else if (orig_vfd < KBOX_LOW_FD_MAX)
-                orig = &ctx->fd_table->low_fds[orig_vfd];
+            struct kbox_fd_entry *orig =
+                fd_table_entry(ctx->fd_table, orig_vfd);
             if (orig && orig->shadow_sp >= 0) {
                 int new_host =
                     request_addfd_at(ctx, req, orig->shadow_sp, (int) newfd, 0);
@@ -2308,6 +2628,10 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                                 for (long j = 0; j < KBOX_FD_TABLE_MAX; j++)
                                     if (ctx->fd_table->entries[j].lkl_fd == sl)
                                         ref = 1;
+                                for (long j = 0; j < KBOX_MID_FD_MAX && !ref;
+                                     j++)
+                                    if (ctx->fd_table->mid_fds[j].lkl_fd == sl)
+                                        ref = 1;
                                 for (long j = 0; j < KBOX_LOW_FD_MAX && !ref;
                                      j++)
                                     if (ctx->fd_table->low_fds[j].lkl_fd == sl)
@@ -2327,10 +2651,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                     int ns = dup(orig->shadow_sp);
                     if (ns >= 0) {
                         struct kbox_fd_entry *ne2 = NULL;
-                        if (nv >= KBOX_FD_BASE)
-                            ne2 = &ctx->fd_table->entries[nv - KBOX_FD_BASE];
-                        else if (nv < KBOX_LOW_FD_MAX)
-                            ne2 = &ctx->fd_table->low_fds[nv];
+                        ne2 = fd_table_entry(ctx->fd_table, nv);
                         if (ne2)
                             ne2->shadow_sp = ns;
                         else
@@ -2340,37 +2661,11 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                 }
             }
         }
-        /* oldfd is a host FD.  If newfd has a stale LKL redirect (from
-         * a previous dup2), clean it up before the host kernel overwrites
-         * the FD.  Without this, the shell's dup2(saved_stdout, 1) leaves
-         * a stale low_fds entry that traps all subsequent writes to FD 1
-         * in LKL.
-         */
-        long stale = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
-        if (stale >= 0) {
-            lkl_close_and_invalidate(ctx, stale);
-            kbox_fd_table_remove(ctx->fd_table, newfd);
-        } else {
-            long sv = kbox_fd_table_find_by_host_fd(ctx->fd_table, newfd);
-            if (sv >= 0) {
-                long sl = kbox_fd_table_get_lkl(ctx->fd_table, sv);
-                kbox_fd_table_remove(ctx->fd_table, sv);
-                if (sl >= 0) {
-                    int ref = 0;
-                    for (long j = 0; j < KBOX_FD_TABLE_MAX; j++)
-                        if (ctx->fd_table->entries[j].lkl_fd == sl)
-                            ref = 1;
-                    for (long j = 0; j < KBOX_LOW_FD_MAX && !ref; j++)
-                        if (ctx->fd_table->low_fds[j].lkl_fd == sl)
-                            ref = 1;
-                    if (!ref) {
-                        kbox_net_deregister_socket((int) sl);
-                        lkl_close_and_invalidate(ctx, sl);
-                    }
-                }
-            }
+        if (!fd_should_deny_io(oldfd, lkl_old)) {
+            cleanup_replaced_fd_tracking(ctx, newfd);
+            return kbox_dispatch_continue();
         }
-        return kbox_dispatch_continue();
+        return kbox_dispatch_errno(EBADF);
     }
 
     if (oldfd == newfd)
@@ -2409,6 +2704,25 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
         return kbox_dispatch_errno(EINVAL);
 
     long lkl_old = kbox_fd_table_get_lkl(ctx->fd_table, oldfd);
+
+    if (lkl_old == KBOX_LKL_FD_SHADOW_ONLY) {
+        if (oldfd == newfd)
+            return kbox_dispatch_errno(EINVAL);
+        uint32_t af = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) oldfd);
+        if (copy < 0)
+            return kbox_dispatch_errno(-copy);
+        int injected = request_addfd_at(ctx, req, copy, (int) newfd, af);
+        close(copy);
+        if (injected < 0)
+            return kbox_dispatch_errno(-injected);
+        cleanup_replaced_fd_tracking(ctx, newfd);
+        track_host_passthrough_fd(ctx->fd_table, newfd);
+        if (flags & O_CLOEXEC)
+            kbox_fd_table_set_cloexec(ctx->fd_table, newfd, 1);
+        return kbox_dispatch_value((int64_t) newfd);
+    }
+
     if (lkl_old < 0) {
         /* Shadow socket dup3: dup3(fd, fd, ...) must return EINVAL. */
         if (oldfd == newfd) {
@@ -2418,11 +2732,8 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
 
         long orig_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, oldfd);
         if (orig_vfd >= 0) {
-            struct kbox_fd_entry *orig = NULL;
-            if (orig_vfd >= KBOX_FD_BASE)
-                orig = &ctx->fd_table->entries[orig_vfd - KBOX_FD_BASE];
-            else if (orig_vfd < KBOX_LOW_FD_MAX)
-                orig = &ctx->fd_table->low_fds[orig_vfd];
+            struct kbox_fd_entry *orig =
+                fd_table_entry(ctx->fd_table, orig_vfd);
             if (orig && orig->shadow_sp >= 0) {
                 uint32_t af = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
                 int new_host = request_addfd_at(ctx, req, orig->shadow_sp,
@@ -2445,6 +2756,10 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                                 for (long j = 0; j < KBOX_FD_TABLE_MAX; j++)
                                     if (ctx->fd_table->entries[j].lkl_fd == sl3)
                                         r3 = 1;
+                                for (long j = 0; j < KBOX_MID_FD_MAX && !r3;
+                                     j++)
+                                    if (ctx->fd_table->mid_fds[j].lkl_fd == sl3)
+                                        r3 = 1;
                                 for (long j = 0; j < KBOX_LOW_FD_MAX && !r3;
                                      j++)
                                     if (ctx->fd_table->low_fds[j].lkl_fd == sl3)
@@ -2464,10 +2779,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                     int ns3 = dup(orig->shadow_sp);
                     if (ns3 >= 0) {
                         struct kbox_fd_entry *ne3 = NULL;
-                        if (nv >= KBOX_FD_BASE)
-                            ne3 = &ctx->fd_table->entries[nv - KBOX_FD_BASE];
-                        else if (nv < KBOX_LOW_FD_MAX)
-                            ne3 = &ctx->fd_table->low_fds[nv];
+                        ne3 = fd_table_entry(ctx->fd_table, nv);
                         if (ne3) {
                             ne3->shadow_sp = ns3;
                             if (flags & O_CLOEXEC)
@@ -2480,32 +2792,11 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                 }
             }
         }
-        /* Same stale-redirect cleanup as forward_dup2. */
-        long stale = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
-        if (stale >= 0) {
-            lkl_close_and_invalidate(ctx, stale);
-            kbox_fd_table_remove(ctx->fd_table, newfd);
-        } else {
-            long sv = kbox_fd_table_find_by_host_fd(ctx->fd_table, newfd);
-            if (sv >= 0) {
-                long sl = kbox_fd_table_get_lkl(ctx->fd_table, sv);
-                kbox_fd_table_remove(ctx->fd_table, sv);
-                if (sl >= 0) {
-                    int ref = 0;
-                    for (long j = 0; j < KBOX_FD_TABLE_MAX; j++)
-                        if (ctx->fd_table->entries[j].lkl_fd == sl)
-                            ref = 1;
-                    for (long j = 0; j < KBOX_LOW_FD_MAX && !ref; j++)
-                        if (ctx->fd_table->low_fds[j].lkl_fd == sl)
-                            ref = 1;
-                    if (!ref) {
-                        kbox_net_deregister_socket((int) sl);
-                        lkl_close_and_invalidate(ctx, sl);
-                    }
-                }
-            }
+        if (!fd_should_deny_io(oldfd, lkl_old)) {
+            cleanup_replaced_fd_tracking(ctx, newfd);
+            return kbox_dispatch_continue();
         }
-        return kbox_dispatch_continue();
+        return kbox_dispatch_errno(EBADF);
     }
 
     if (oldfd == newfd)
@@ -2538,8 +2829,11 @@ static struct kbox_dispatch forward_fstat(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
     /* If a shadow already exists (from a prior mmap), let the host handle
      * fstat against the memfd.  Do NOT create a shadow here; fstat is a
      * metadata query that LKL answers directly without the expensive
@@ -2702,13 +2996,9 @@ int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
         nr == h->sched_getscheduler || nr == h->sched_get_priority_max ||
         nr == h->sched_get_priority_min || nr == h->sched_setaffinity ||
         nr == h->sched_getaffinity || nr == h->getrlimit ||
-        nr == h->getrusage || nr == h->epoll_create1 || nr == h->epoll_ctl ||
-        nr == h->epoll_wait || nr == h->epoll_pwait || nr == h->ppoll ||
-        nr == h->pselect6 || nr == h->poll || nr == h->nanosleep ||
-        nr == h->clock_nanosleep || nr == h->timerfd_create ||
-        nr == h->timerfd_settime || nr == h->timerfd_gettime ||
-        nr == h->eventfd || nr == h->eventfd2 || nr == h->statfs ||
-        nr == h->fstatfs || nr == h->sysinfo) {
+        nr == h->getrusage || nr == h->ppoll || nr == h->pselect6 ||
+        nr == h->poll || nr == h->nanosleep || nr == h->clock_nanosleep ||
+        nr == h->statfs || nr == h->sysinfo) {
         *out = kbox_dispatch_continue();
         return 1;
     }
@@ -2841,8 +3131,11 @@ static struct kbox_dispatch forward_fchdir(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd < 0)
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
 
     long ret = kbox_lkl_fchdir(ctx->sysnrs, lkl_fd);
     if (ret >= 0)
@@ -3321,92 +3614,106 @@ static struct kbox_dispatch forward_chown_legacy(
  */
 
 /* DISPATCH_FORWARD: forwarded to a handler that takes (req, ctx). */
-#define DISPATCH_FORWARD_TABLE(_)           \
-    /* Legacy x86_64 syscalls. */           \
-    _(access, forward_access_legacy)        \
-    _(mkdir, forward_mkdir_legacy)          \
-    _(rmdir, forward_rmdir_legacy)          \
-    _(unlink, forward_unlink_legacy)        \
-    _(rename, forward_rename_legacy)        \
-    _(chmod, forward_chmod_legacy)          \
-    _(chown, forward_chown_legacy)          \
-    _(open, forward_open_legacy)            \
-    /* File open/create. */                 \
-    _(openat, forward_openat)               \
-    _(openat2, forward_openat2)             \
-    /* Metadata. */                         \
-    _(fstat, forward_fstat)                 \
-    _(newfstatat, forward_newfstatat)       \
-    _(statx, forward_statx)                 \
-    _(faccessat2, forward_faccessat2)       \
-    /* Directories. */                      \
-    _(getdents64, forward_getdents64)       \
-    _(getdents, forward_getdents)           \
-    _(mkdirat, forward_mkdirat)             \
-    _(unlinkat, forward_unlinkat)           \
-    _(renameat2, forward_renameat2)         \
-    _(fchmodat, forward_fchmodat)           \
-    _(fchownat, forward_fchownat)           \
-    /* Navigation. */                       \
-    _(chdir, forward_chdir)                 \
-    _(fchdir, forward_fchdir)               \
-    _(getcwd, forward_getcwd)               \
-    /* Mount. */                            \
-    _(mount, forward_mount)                 \
-    _(umount2, forward_umount2)             \
-    /* FD operations. */                    \
-    _(close, forward_close)                 \
-    _(fcntl, forward_fcntl)                 \
-    _(dup, forward_dup)                     \
-    _(dup2, forward_dup2)                   \
-    _(dup3, forward_dup3)                   \
-    /* I/O. */                              \
-    _(write, forward_write)                 \
-    _(lseek, forward_lseek)                 \
-    /* Networking. */                       \
-    _(socket, forward_socket)               \
-    _(bind, forward_bind)                   \
-    _(connect, forward_connect)             \
-    _(sendto, forward_sendto)               \
-    _(recvfrom, forward_recvfrom)           \
-    _(recvmsg, forward_recvmsg)             \
-    _(getsockopt, forward_getsockopt)       \
-    _(setsockopt, forward_setsockopt)       \
-    _(getsockname, forward_getsockname)     \
-    _(getpeername, forward_getpeername)     \
-    _(shutdown, forward_shutdown)           \
-    /* I/O extended. */                     \
-    _(pwrite64, forward_pwrite64)           \
-    _(writev, forward_writev)               \
-    _(readv, forward_readv)                 \
-    _(ftruncate, forward_ftruncate)         \
-    _(fallocate, forward_fallocate)         \
-    _(flock, forward_flock)                 \
-    _(fsync, forward_fsync)                 \
-    _(fdatasync, forward_fdatasync)         \
-    _(sync, forward_sync)                   \
-    _(ioctl, forward_ioctl)                 \
-    /* File operations. */                  \
-    _(readlinkat, forward_readlinkat)       \
-    _(pipe2, forward_pipe2)                 \
-    _(symlinkat, forward_symlinkat)         \
-    _(linkat, forward_linkat)               \
-    _(utimensat, forward_utimensat)         \
-    _(sendfile, forward_sendfile)           \
-    /* Time. */                             \
-    _(clock_gettime, forward_clock_gettime) \
-    _(clock_getres, forward_clock_getres)   \
-    _(gettimeofday, forward_gettimeofday)   \
-    /* Process lifecycle. */                \
-    _(umask, forward_umask)                 \
-    _(uname, forward_uname)                 \
-    _(getrandom, forward_getrandom)         \
-    _(syslog, forward_syslog)               \
-    _(prctl, forward_prctl)                 \
-    /* Threading. */                        \
-    _(clone3, forward_clone3)
+#define DISPATCH_FORWARD_TABLE(_)                                             \
+    /* Legacy x86_64 syscalls. */                                             \
+    _(access, forward_access_legacy)                                          \
+    _(mkdir, forward_mkdir_legacy)                                            \
+    _(rmdir, forward_rmdir_legacy)                                            \
+    _(unlink, forward_unlink_legacy)                                          \
+    _(rename, forward_rename_legacy)                                          \
+    _(chmod, forward_chmod_legacy)                                            \
+    _(chown, forward_chown_legacy)                                            \
+    _(open, forward_open_legacy)                                              \
+    /* File open/create. */                                                   \
+    _(openat, forward_openat)                                                 \
+    _(openat2, forward_openat2)                                               \
+    /* Metadata. */                                                           \
+    _(fstat, forward_fstat)                                                   \
+    _(newfstatat, forward_newfstatat)                                         \
+    _(statx, forward_statx)                                                   \
+    _(faccessat2, forward_faccessat2)                                         \
+    /* Directories. */                                                        \
+    _(getdents64, forward_getdents64)                                         \
+    _(getdents, forward_getdents)                                             \
+    _(mkdirat, forward_mkdirat)                                               \
+    _(unlinkat, forward_unlinkat)                                             \
+    _(renameat2, forward_renameat2)                                           \
+    _(fchmodat, forward_fchmodat)                                             \
+    _(fchownat, forward_fchownat)                                             \
+    /* Navigation. */                                                         \
+    _(chdir, forward_chdir)                                                   \
+    _(fchdir, forward_fchdir)                                                 \
+    _(getcwd, forward_getcwd)                                                 \
+    /* Mount. */                                                              \
+    _(mount, forward_mount)                                                   \
+    _(umount2, forward_umount2)                                               \
+    /* FD operations. */                                                      \
+    _(close, forward_close)                                                   \
+    _(fcntl, forward_fcntl)                                                   \
+    _(dup, forward_dup)                                                       \
+    _(dup2, forward_dup2)                                                     \
+    _(dup3, forward_dup3)                                                     \
+    /* I/O. */                                                                \
+    _(write, forward_write)                                                   \
+    _(lseek, forward_lseek)                                                   \
+    /* Networking. */                                                         \
+    _(socket, forward_socket)                                                 \
+    _(bind, forward_bind)                                                     \
+    _(connect, forward_connect)                                               \
+    _(sendto, forward_sendto)                                                 \
+    _(recvfrom, forward_recvfrom)                                             \
+    _(recvmsg, forward_recvmsg)                                               \
+    _(getsockopt, forward_getsockopt)                                         \
+    _(setsockopt, forward_setsockopt)                                         \
+    _(getsockname, forward_getsockname)                                       \
+    _(getpeername, forward_getpeername)                                       \
+    _(shutdown, forward_shutdown)                                             \
+    /* I/O extended. */                                                       \
+    _(pwrite64, forward_pwrite64)                                             \
+    _(writev, forward_writev)                                                 \
+    _(readv, forward_readv)                                                   \
+    _(ftruncate, forward_ftruncate)                                           \
+    _(fallocate, forward_fallocate)                                           \
+    _(flock, forward_flock)                                                   \
+    _(fsync, forward_fsync)                                                   \
+    _(fdatasync, forward_fdatasync)                                           \
+    _(sync, forward_sync)                                                     \
+    _(ioctl, forward_ioctl)                                                   \
+    /* File operations. */                                                    \
+    _(readlinkat, forward_readlinkat)                                         \
+    _(pipe2, forward_pipe2)                                                   \
+    _(symlinkat, forward_symlinkat)                                           \
+    _(linkat, forward_linkat)                                                 \
+    _(utimensat, forward_utimensat)                                           \
+    _(sendfile, forward_sendfile)                                             \
+    /* Time. */                                                               \
+    _(clock_gettime, forward_clock_gettime)                                   \
+    _(clock_getres, forward_clock_getres)                                     \
+    _(gettimeofday, forward_gettimeofday)                                     \
+    /* Process lifecycle. */                                                  \
+    _(umask, forward_umask)                                                   \
+    _(uname, forward_uname)                                                   \
+    _(getrandom, forward_getrandom)                                           \
+    _(syslog, forward_syslog)                                                 \
+    _(prctl, forward_prctl)                                                   \
+    /* Threading. */                                                          \
+    _(clone3, forward_clone3)                                                 \
+    /* FD-creating syscalls tracked as host-passthrough. */                   \
+    _(eventfd2, forward_eventfd)                                              \
+    _(timerfd_create, forward_timerfd_create)                                 \
+    _(epoll_create1, forward_epoll_create1)                                   \
+    /* FD-consuming syscalls gated by deny check (were in CONTINUE table). */ \
+    _(epoll_ctl, forward_epoll_ctl_gated)                                     \
+    _(epoll_wait, forward_fd_gated_continue)                                  \
+    _(epoll_pwait, forward_fd_gated_continue)                                 \
+    _(timerfd_settime, forward_fd_gated_continue)                             \
+    _(timerfd_gettime, forward_fd_gated_continue)                             \
+    _(fstatfs, forward_fd_gated_continue)
 
-/* DISPATCH_CONTINUE: host kernel handles directly, no LKL involvement. */
+/* DISPATCH_CONTINUE: host kernel handles directly, no LKL involvement.
+ * Only non-FD syscalls remain here; FD-based syscalls are in the handler
+ * table so their FD arguments can be validated.
+ */
 /* clang-format off */
 #define DISPATCH_CONTINUE_TABLE(_)                                             \
     _(setpgid) _(getpgid) _(getsid) _(setsid) _(brk) _(wait4) _(waitid)        \
@@ -3417,14 +3724,12 @@ static struct kbox_dispatch forward_chown_legacy(
     _(sched_yield) _(sched_setparam) _(sched_getparam) _(sched_setscheduler)   \
     _(sched_getscheduler) _(sched_get_priority_max) _(sched_get_priority_min)  \
     _(sched_setaffinity) _(sched_getaffinity)                                  \
-    /* I/O multiplexing. */                                                    \
-    _(epoll_create1) _(epoll_ctl) _(epoll_wait) _(epoll_pwait) _(ppoll)        \
-    _(pselect6) _(poll)                                                        \
-    /* Sleep/timer. */                                                         \
-    _(nanosleep) _(clock_nanosleep) _(timerfd_create) _(timerfd_settime)       \
-    _(timerfd_gettime) _(eventfd) _(eventfd2)                                  \
-    /* Filesystem info. */                                                     \
-    _(statfs) _(fstatfs) _(sysinfo)
+    /* I/O multiplexing (non-FD-creating multiplexers only). */                \
+    _(ppoll) _(pselect6) _(poll)                                               \
+    /* Sleep. */                                                               \
+    _(nanosleep) _(clock_nanosleep)                                            \
+    /* Filesystem info (path-based statfs stays; FD-based fstatfs moved). */   \
+    _(statfs) _(sysinfo)
 /* clang-format on */
 
 struct kbox_dispatch kbox_dispatch_request(
@@ -3560,6 +3865,22 @@ struct kbox_dispatch kbox_dispatch_request(
     if (nr == h->setfsgid)
         return dispatch_set_id(req, ctx, forward_setfsgid);
 
+    /* Legacy eventfd syscall (one arg, no flags). eventfd2 is in the handler
+     * table; the raw eventfd(2) syscall does not take a flags argument.
+     */
+    if (nr == h->eventfd) {
+        unsigned int initval = (unsigned int) kbox_syscall_request_arg(req, 0);
+        int host_fd = eventfd(initval, 0);
+        if (host_fd < 0)
+            return kbox_dispatch_errno(errno);
+        int tfd = request_addfd(ctx, req, host_fd, 0);
+        close(host_fd);
+        if (tfd < 0)
+            return kbox_dispatch_errno(-tfd);
+        track_host_passthrough_fd(ctx->fd_table, tfd);
+        return kbox_dispatch_value(tfd);
+    }
+
     /* Legacy pipe syscall: one arg, create host pipe2 and inject via ADDFD. */
 
     if (nr == h->pipe) {
@@ -3586,6 +3907,9 @@ struct kbox_dispatch kbox_dispatch_request(
         }
         close(host_pfds[0]);
         close(host_pfds[1]);
+
+        track_host_passthrough_fd(ctx->fd_table, tfd0);
+        track_host_passthrough_fd(ctx->fd_table, tfd1);
 
         int gfds[2] = {tfd0, tfd1};
         int pwrc = guest_mem_write(ctx, ppid, remote_pfd, gfds, sizeof(gfds));
